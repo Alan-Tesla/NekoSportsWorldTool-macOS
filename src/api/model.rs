@@ -89,6 +89,9 @@ pub struct Config {
     /// 自定义路径是否受电子围栏裁剪。
     #[serde(default = "default_true")]
     pub custom_clip_fence: bool,
+    /// 地图底图源：gaode | osm | vector。
+    #[serde(default = "default_tile_source")]
+    pub tile_source: String,
 }
 
 fn default_route_mode() -> String {
@@ -101,6 +104,10 @@ fn default_custom_close_mode() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_tile_source() -> String {
+    "gaode".into()
 }
 
 fn default_f32() -> f32 {
@@ -143,6 +150,7 @@ impl Default for Config {
             custom_waypoints: Vec::new(),
             custom_close_mode: default_custom_close_mode(),
             custom_clip_fence: true,
+            tile_source: default_tile_source(),
         }
     }
 }

@@ -57,16 +57,50 @@ pub fn load_network_path(path: &str) -> Result<RoadGraph, String> {
     route_planner::load_osm(&bytes)
 }
 
-/// 路网预览计划（供地图显示）：对齐后的路网/建筑 + 生成的路线（BD 系）。
+/// 路网预览计划（供地图显示）：对齐后的路网/建筑/水绿地/操场/标签 + 生成的路线（BD 系）。
 #[derive(Clone, Default)]
 pub struct RoadPlan {
     pub route: Vec<(f64, f64)>,
     pub length_m: f64,
     pub edges: Vec<Vec<(f64, f64)>>,
     pub buildings: Vec<Vec<(f64, f64)>>,
+    pub waters: Vec<Vec<(f64, f64)>>,
+    pub greens: Vec<Vec<(f64, f64)>>,
+    pub pitches: Vec<Vec<(f64, f64)>>,
+    /// `(lat, lon, name, kind)`
+    pub labels: Vec<(f64, f64, String, String)>,
     pub checkpoints: Vec<(f64, f64)>,
     pub fences: Vec<Vec<(f64, f64)>>,
     pub route_error: Option<String>,
+}
+
+fn extract_map_features(
+    g: &RoadGraph,
+) -> (
+    Vec<Vec<(f64, f64)>>,
+    Vec<Vec<(f64, f64)>>,
+    Vec<Vec<(f64, f64)>>,
+    Vec<Vec<(f64, f64)>>,
+    Vec<Vec<(f64, f64)>>,
+    Vec<(f64, f64, String, String)>,
+) {
+    let to_rings = |rings: &[Vec<Coord>]| -> Vec<Vec<(f64, f64)>> {
+        rings
+            .iter()
+            .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
+            .collect()
+    };
+    let edges = to_rings(&g.edges_deg());
+    let buildings = to_rings(&g.buildings);
+    let waters = to_rings(&g.waters);
+    let greens = to_rings(&g.greens);
+    let pitches = to_rings(&g.pitches);
+    let labels = g
+        .labels
+        .iter()
+        .map(|l| (l.coord.lat, l.coord.lon, l.name.clone(), l.kind.clone()))
+        .collect();
+    (edges, buildings, waters, greens, pitches, labels)
 }
 
 /// 用围栏（BD 系，与打卡点同系）裁剪路网：仅保留围栏内道路；裁剪后无路则退回原网。
@@ -123,21 +157,16 @@ pub fn plan_road_view(
     let opts = RouteOptions::default();
     let route = plan_route_split(&g, &waypoints, &[], dist, seed, &opts)?;
     let route_pts: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lon)).collect();
-    let edges: Vec<Vec<(f64, f64)>> = g
-        .edges_deg()
-        .iter()
-        .map(|e| e.iter().map(|c| (c.lat, c.lon)).collect())
-        .collect();
-    let buildings: Vec<Vec<(f64, f64)>> = g
-        .buildings
-        .iter()
-        .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
-        .collect();
+    let (edges, buildings, waters, greens, pitches, labels) = extract_map_features(&g);
     Ok(RoadPlan {
         route: route_pts,
         length_m: route.length_m,
         edges,
         buildings,
+        waters,
+        greens,
+        pitches,
+        labels,
         checkpoints: ordered,
         fences: fences.to_vec(),
         route_error: None,
@@ -166,22 +195,17 @@ pub fn plan_custom_view(
         if clip_fence {
             g = apply_fences(&g, fences);
         }
-        let edges: Vec<Vec<(f64, f64)>> = g
-            .edges_deg()
-            .iter()
-            .map(|e| e.iter().map(|c| (c.lat, c.lon)).collect())
-            .collect();
-        let buildings: Vec<Vec<(f64, f64)>> = g
-            .buildings
-            .iter()
-            .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
-            .collect();
+        let (edges, buildings, waters, greens, pitches, labels) = extract_map_features(&g);
         if waypoints_bd.is_empty() {
             return RoadPlan {
                 route: Vec::new(),
                 length_m: 0.0,
                 edges,
                 buildings,
+                waters,
+                greens,
+                pitches,
+                labels,
                 checkpoints: ordered_cp,
                 fences: fences.to_vec(),
                 route_error: Some("左键点击地图添加起点与途经点，拖拽可调整位置，右键删除".into()),
@@ -201,6 +225,10 @@ pub fn plan_custom_view(
                     length_m: route.length_m,
                     edges,
                     buildings,
+                    waters,
+                    greens,
+                    pitches,
+                    labels,
                     checkpoints: ordered_cp,
                     fences: fences.to_vec(),
                     route_error: None,
@@ -211,6 +239,10 @@ pub fn plan_custom_view(
                 length_m: 0.0,
                 edges,
                 buildings,
+                waters,
+                greens,
+                pitches,
+                labels,
                 checkpoints: ordered_cp,
                 fences: fences.to_vec(),
                 route_error: Some(e),
@@ -221,14 +253,13 @@ pub fn plan_custom_view(
             return RoadPlan {
                 route: waypoints_bd.to_vec(),
                 length_m: 0.0,
-                edges: Vec::new(),
-                buildings: Vec::new(),
                 checkpoints: ordered_cp,
                 fences: fences.to_vec(),
                 route_error: Some(
                     "左键点击地图添加至少 2 个途经点即可规划路线（导入 OSM 后可沿真实道路寻路）"
                         .into(),
                 ),
+                ..Default::default()
             };
         }
         let close_loop = close_mode != CustomCloseMode::OutAndBack;
@@ -244,11 +275,10 @@ pub fn plan_custom_view(
         RoadPlan {
             route: route_pts,
             length_m,
-            edges: Vec::new(),
-            buildings: Vec::new(),
             checkpoints: ordered_cp,
             fences: fences.to_vec(),
             route_error: None,
+            ..Default::default()
         }
     }
 }
@@ -290,6 +320,32 @@ pub fn align_network(net: &mut RoadGraph) {
             c.lat = lat;
             c.lon = lon;
         }
+    }
+    for ring in net.waters.iter_mut() {
+        for c in ring.iter_mut() {
+            let (lat, lon) = wgs84_to_bd09(c.lat, c.lon);
+            c.lat = lat;
+            c.lon = lon;
+        }
+    }
+    for ring in net.greens.iter_mut() {
+        for c in ring.iter_mut() {
+            let (lat, lon) = wgs84_to_bd09(c.lat, c.lon);
+            c.lat = lat;
+            c.lon = lon;
+        }
+    }
+    for ring in net.pitches.iter_mut() {
+        for c in ring.iter_mut() {
+            let (lat, lon) = wgs84_to_bd09(c.lat, c.lon);
+            c.lat = lat;
+            c.lon = lon;
+        }
+    }
+    for lb in net.labels.iter_mut() {
+        let (lat, lon) = wgs84_to_bd09(lb.coord.lat, lb.coord.lon);
+        lb.coord.lat = lat;
+        lb.coord.lon = lon;
     }
     net.compute_anchor();
     net.rebuild_index();

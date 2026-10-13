@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use route_planner::RoadGraph;
 
-use super::map::{collect_scene_bounds, MapState};
+use super::map::{collect_scene_bounds, MapState, TileSource};
 use super::{mobile, theme, App};
 use crate::track::generate_road::{
     plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RoadPlan, RouteMode,
@@ -21,6 +21,8 @@ pub struct OsmPage {
     pub map: MapState,
     pub fitted: bool,
     pub snap_road: bool,
+    pub show_road_overlay: bool,
+    pub show_labels: bool,
     pub preview: Option<RoadPlan>,
     pub preview_stale: bool,
 }
@@ -34,6 +36,8 @@ impl Default for OsmPage {
             map: MapState::default(),
             fitted: false,
             snap_road: true,
+            show_road_overlay: true,
+            show_labels: true,
             preview: None,
             preview_stale: true,
         }
@@ -97,9 +101,11 @@ impl App {
             ui.colored_label(theme::plain(), &self.osm_page.status);
         }
 
-        // ── 第 2 栏：路径规划工具栏 ─────────────────────────────────
+        // ── 第 2 栏：路径规划与底图工具栏 ───────────────────────────
         let mut close_mode = CustomCloseMode::from_str(&self.config.custom_close_mode);
         let prev_close = close_mode;
+        let mut tile_source = TileSource::from_str(&self.config.tile_source);
+        let prev_tile = tile_source;
         let prev_clip = self.config.custom_clip_fence;
         let mut need_sync = false;
         let mut fit_requested = false;
@@ -109,9 +115,25 @@ impl App {
 
         ui.add_space(2.0);
         mobile::row(ui, |ui| {
-            ui.label("规划模式：");
+            ui.label("底图：");
+            egui::ComboBox::from_id_salt("osm_tile_source")
+                .width(150.0)
+                .selected_text(tile_source.label())
+                .show_ui(ui, |ui| {
+                    for s in [
+                        TileSource::GaodeStreet,
+                        TileSource::OsmStandard,
+                        TileSource::VectorOnly,
+                    ] {
+                        ui.selectable_value(&mut tile_source, s, s.label());
+                    }
+                });
+            ui.checkbox(&mut self.osm_page.show_road_overlay, "路网图层");
+            ui.checkbox(&mut self.osm_page.show_labels, "名称标注");
+            ui.separator();
+            ui.label("规划：");
             egui::ComboBox::from_id_salt("osm_custom_close_mode")
-                .width(185.0)
+                .width(175.0)
                 .selected_text(close_mode.label())
                 .show_ui(ui, |ui| {
                     for m in [
@@ -124,7 +146,9 @@ impl App {
                 });
             ui.checkbox(&mut self.osm_page.snap_road, "道路吸附");
             ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
-            ui.separator();
+        });
+
+        mobile::row(ui, |ui| {
             if ui
                 .button("串联打卡点")
                 .on_hover_text("按环序将当前学校的打卡点填入途经点，可在此基础上拖拽微调")
@@ -184,6 +208,10 @@ impl App {
         if close_mode != prev_close {
             self.config.custom_close_mode = close_mode.as_str().into();
             need_sync = true;
+        }
+        if tile_source != prev_tile {
+            self.config.tile_source = tile_source.as_str().into();
+            let _ = crate::api::model::save_config(&self.config);
         }
         if self.config.custom_clip_fence != prev_clip {
             need_sync = true;
@@ -277,7 +305,8 @@ impl App {
         super::map::legend(
             ui,
             &[
-                ("道路", egui::Color32::from_rgb(190, 200, 196)),
+                ("可跑道路", egui::Color32::from_rgb(16, 135, 115)),
+                ("操场跑道", egui::Color32::from_rgb(116, 186, 132)),
                 ("建筑", egui::Color32::from_rgb(214, 182, 158)),
                 ("电子围栏", egui::Color32::from_rgb(180, 118, 0)),
                 ("打卡点", egui::Color32::from_rgb(240, 180, 0)),
@@ -314,7 +343,7 @@ impl App {
                         bounds.extend(b.iter().copied());
                     }
                 }
-                if bounds.is_empty() && !self.identity.has_unconfigured_default_location() {
+                if bounds.is_empty() {
                     bounds.push((self.identity.anchor_lat, self.identity.anchor_lon));
                 }
                 if !bounds.is_empty() {
@@ -327,41 +356,44 @@ impl App {
             self.osm_page.map.zoom_at(canvas, canvas.center(), factor);
         }
 
+        // 底色填充 + 在线瓦片底图渲染
         painter.rect_filled(
             canvas,
             egui::Rounding::same(4.0),
-            egui::Color32::from_rgb(248, 251, 249),
+            egui::Color32::from_rgb(242, 239, 233),
         );
+        self.osm_page
+            .map
+            .draw_tile_basemap(ui.ctx(), &painter, canvas, tile_source);
 
         if let Some(p) = &self.osm_page.preview {
-            let road_color = egui::Color32::from_rgb(196, 206, 202);
-            for e in &p.edges {
-                self.osm_page
-                    .map
-                    .draw_polyline(&painter, canvas, e, road_color, 1.2);
-            }
-            let bld_color = egui::Color32::from_rgb(220, 190, 166);
-            for b in &p.buildings {
-                self.osm_page
-                    .map
-                    .draw_polygon(&painter, canvas, b, bld_color, 1.0);
-            }
+            let has_tiles = tile_source != TileSource::VectorOnly;
+            self.osm_page.map.draw_rich_osm_layer(
+                &painter,
+                canvas,
+                p,
+                has_tiles,
+                self.osm_page.show_road_overlay,
+                self.osm_page.show_labels,
+            );
+
+            let clipped = painter.with_clip_rect(canvas);
             let fence_color = egui::Color32::from_rgb(180, 118, 0);
             for f in &p.fences {
                 self.osm_page
                     .map
-                    .draw_polygon(&painter, canvas, f, fence_color, 2.0);
+                    .draw_polygon(&clipped, canvas, f, fence_color, 2.2);
             }
             // 学校打卡点（金色圆点 + 白边）
             let cp_color = egui::Color32::from_rgb(240, 180, 0);
             for &(la, lo) in &p.checkpoints {
                 let sp = self.osm_page.map.to_screen(canvas, la, lo);
                 if canvas.contains(sp) {
-                    painter.circle_filled(sp, 4.5, cp_color);
-                    painter.circle_stroke(
+                    clipped.circle_filled(sp, 5.0, cp_color);
+                    clipped.circle_stroke(
                         sp,
-                        4.5,
-                        egui::Stroke::new(1.2_f32, egui::Color32::WHITE),
+                        5.0,
+                        egui::Stroke::new(1.4_f32, egui::Color32::WHITE),
                     );
                 }
             }
@@ -377,28 +409,13 @@ impl App {
                     canvas,
                     &p.route,
                     route_color,
-                    2.8,
+                    3.0,
                 );
             }
             // 用户途经点序号徽章
             self.osm_page
                 .map
                 .draw_waypoints(&painter, canvas, &self.config.custom_waypoints);
-
-            // 空画布引导文案
-            if p.edges.is_empty()
-                && p.checkpoints.is_empty()
-                && p.fences.is_empty()
-                && self.config.custom_waypoints.is_empty()
-            {
-                painter.text(
-                    canvas.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "左键点击地图即可添加途经点规划路径\n（导入 OSM 路网或登录后刷新打卡点可显示校园底图）",
-                    egui::FontId::proportional(14.0),
-                    egui::Color32::from_rgb(140, 152, 148),
-                );
-            }
         }
 
         self.osm_page.map.draw_scale_bar(&painter, canvas);

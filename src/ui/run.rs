@@ -4,7 +4,7 @@
 //! 内抽样，并保证「开始 + 用时」不越过当前时刻；指定模式完全按用户填写的时/分
 //! （尚未到达时按当前时刻），「换一版」只重掷运动量，不动时刻。
 
-use super::map::{collect_scene_bounds, MapState};
+use super::map::{collect_scene_bounds, MapState, TileSource};
 use super::{mobile, theme, App};
 use crate::track::generate_road::{
     plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RouteMode,
@@ -675,12 +675,27 @@ impl App {
         }
 
         if self.run_page.preview.is_some() {
+            let mut tile_source = TileSource::from_str(&self.config.tile_source);
+            let prev_tile = tile_source;
             mobile::row(ui, |ui| {
+                ui.label("底图：");
+                egui::ComboBox::from_id_salt("run_tile_source")
+                    .width(145.0)
+                    .selected_text(tile_source.label())
+                    .show_ui(ui, |ui| {
+                        for s in [
+                            TileSource::GaodeStreet,
+                            TileSource::OsmStandard,
+                            TileSource::VectorOnly,
+                        ] {
+                            ui.selectable_value(&mut tile_source, s, s.label());
+                        }
+                    });
+                ui.checkbox(&mut self.osm_page.show_road_overlay, "路网");
                 super::map::legend(
                     ui,
                     &[
-                        ("道路", egui::Color32::from_rgb(200, 208, 204)),
-                        ("建筑", egui::Color32::from_rgb(224, 194, 170)),
+                        ("可跑路网", egui::Color32::from_rgb(16, 135, 115)),
                         ("围栏", egui::Color32::from_rgb(180, 118, 0)),
                         ("路线", egui::Color32::from_rgb(30, 111, 216)),
                         ("打卡点", egui::Color32::from_rgb(240, 180, 0)),
@@ -692,6 +707,10 @@ impl App {
                     self.run_page.map_fitted = false;
                 }
             });
+            if tile_source != prev_tile {
+                self.config.tile_source = tile_source.as_str().into();
+                let _ = crate::api::model::save_config(&self.config);
+            }
         }
 
         ui.add_space(4.0);
@@ -708,7 +727,7 @@ impl App {
         painter.rect_filled(
             canvas,
             egui::Rounding::same(4.0),
-            egui::Color32::from_rgb(250, 252, 251),
+            egui::Color32::from_rgb(242, 239, 233),
         );
 
         // 首次预览后适配视野：优先围栏/途经点/路线/打卡点/道路
@@ -725,7 +744,7 @@ impl App {
                     &p.checkpoints,
                     &p.edges,
                 );
-                if bounds.is_empty() && !self.identity.has_unconfigured_default_location() {
+                if bounds.is_empty() {
                     bounds.push((self.identity.anchor_lat, self.identity.anchor_lon));
                 }
                 if !bounds.is_empty() {
@@ -735,36 +754,45 @@ impl App {
             }
         }
 
+        let tile_source = TileSource::from_str(&self.config.tile_source);
+        self.run_page
+            .map
+            .draw_tile_basemap(ui.ctx(), &painter, canvas, tile_source);
+
         if let Some(p) = &self.run_page.preview {
-            let road = egui::Color32::from_rgb(200, 208, 204);
-            for e in &p.edges {
-                self.run_page
-                    .map
-                    .draw_polyline(&painter, canvas, e, road, 1.0);
-            }
-            let bld = egui::Color32::from_rgb(224, 194, 170);
-            for b in &p.buildings {
-                self.run_page
-                    .map
-                    .draw_polygon(&painter, canvas, b, bld, 1.0);
-            }
+            let has_tiles = tile_source != TileSource::VectorOnly;
+            self.run_page.map.draw_rich_osm_layer(
+                &painter,
+                canvas,
+                p,
+                has_tiles,
+                self.osm_page.show_road_overlay,
+                self.osm_page.show_labels,
+            );
+            let clipped = painter.with_clip_rect(canvas);
             let fence_c = egui::Color32::from_rgb(180, 118, 0);
             for f in &p.fences {
                 self.run_page
                     .map
-                    .draw_polygon(&painter, canvas, f, fence_c, 2.0);
+                    .draw_polygon(&clipped, canvas, f, fence_c, 2.0);
             }
             let cp = egui::Color32::from_rgb(240, 180, 0);
             for &(la, lo) in &p.checkpoints {
-                self.run_page
-                    .map
-                    .draw_point(&painter, canvas, la, lo, cp, 3.8);
+                let sp = self.run_page.map.to_screen(canvas, la, lo);
+                if canvas.contains(sp) {
+                    clipped.circle_filled(sp, 4.5, cp);
+                    clipped.circle_stroke(
+                        sp,
+                        4.5,
+                        egui::Stroke::new(1.2_f32, egui::Color32::WHITE),
+                    );
+                }
             }
             let route_c = egui::Color32::from_rgb(30, 111, 216);
             if p.route.len() >= 2 {
                 self.run_page
                     .map
-                    .draw_route_with_arrows(&painter, canvas, &p.route, route_c, 2.5);
+                    .draw_route_with_arrows(&painter, canvas, &p.route, route_c, 2.8);
             }
             if is_custom {
                 self.run_page
@@ -773,7 +801,7 @@ impl App {
             } else {
                 if let Some(first) = p.route.first() {
                     self.run_page.map.draw_point(
-                        &painter,
+                        &clipped,
                         canvas,
                         first.0,
                         first.1,
@@ -783,7 +811,7 @@ impl App {
                 }
                 if let Some(last) = p.route.last() {
                     self.run_page.map.draw_point(
-                        &painter,
+                        &clipped,
                         canvas,
                         last.0,
                         last.1,

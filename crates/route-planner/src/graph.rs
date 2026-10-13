@@ -29,6 +29,15 @@ pub struct NodeData {
     pub coord: Coord,
 }
 
+/// 地图名称标注（建筑、操场、道路、兴趣点）。
+#[derive(Clone, Debug)]
+pub struct MapLabel {
+    pub coord: Coord,
+    pub name: String,
+    /// `"building"` | `"sport"` | `"road"` | `"poi"`
+    pub kind: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct EdgeData {
     /// OSM way id（同一物理道路切分出的多段共享，用于重复惩罚）。
@@ -75,6 +84,14 @@ pub struct RoadGraph {
     pub meter_per_lng: f64,
     /// 建筑外环（度）。
     pub buildings: Vec<Vec<Coord>>,
+    /// 水域外环（度）。
+    pub waters: Vec<Vec<Coord>>,
+    /// 绿地/公园/草坪外环（度）。
+    pub greens: Vec<Vec<Coord>>,
+    /// 操场/跑道/球场外环（度）。
+    pub pitches: Vec<Vec<Coord>>,
+    /// 地图文字标注（建筑名、路名、操场名、校门等）。
+    pub labels: Vec<MapLabel>,
     index: RTree<Seg>,
 }
 
@@ -85,6 +102,10 @@ impl RoadGraph {
             anchor: Coord::new(0.0, 0.0),
             meter_per_lng: MET_PER_DEG_LNG_EQ,
             buildings: Vec::new(),
+            waters: Vec::new(),
+            greens: Vec::new(),
+            pitches: Vec::new(),
+            labels: Vec::new(),
             index: RTree::new(),
         }
     }
@@ -207,6 +228,28 @@ impl RoadGraph {
                 c.lat += dlat;
                 c.lon += dlng;
             }
+        }
+        for ring in self.waters.iter_mut() {
+            for c in ring.iter_mut() {
+                c.lat += dlat;
+                c.lon += dlng;
+            }
+        }
+        for ring in self.greens.iter_mut() {
+            for c in ring.iter_mut() {
+                c.lat += dlat;
+                c.lon += dlng;
+            }
+        }
+        for ring in self.pitches.iter_mut() {
+            for c in ring.iter_mut() {
+                c.lat += dlat;
+                c.lon += dlng;
+            }
+        }
+        for lb in self.labels.iter_mut() {
+            lb.coord.lat += dlat;
+            lb.coord.lon += dlng;
         }
         self.anchor.lat += dlat;
         self.anchor.lon += dlng;
