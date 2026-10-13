@@ -401,7 +401,310 @@ pub fn repeat_last_loop(waypoints: &mut Vec<(f64, f64)>) -> bool {
     }
 }
 
-/// 生成标准 400m 田径操场跑道椭圆点集（BD-09 `(lat, lon)`，共 12 个有序控制点）：
+/// 跑圈入点模式
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum LoopEntryMode {
+    #[default]
+    AutoClosest, // 自动选择离上一路径点最近的点入圈（无缝进场）
+    South,       // 南侧直道
+    North,       // 北侧直道
+    East,        // 东侧弯道
+    West,        // 西侧弯道
+}
+
+impl LoopEntryMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "south" => LoopEntryMode::South,
+            "north" => LoopEntryMode::North,
+            "east" => LoopEntryMode::East,
+            "west" => LoopEntryMode::West,
+            _ => LoopEntryMode::AutoClosest,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoopEntryMode::AutoClosest => "auto",
+            LoopEntryMode::South => "south",
+            LoopEntryMode::North => "north",
+            LoopEntryMode::East => "east",
+            LoopEntryMode::West => "west",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            LoopEntryMode::AutoClosest => "自动最近入点",
+            LoopEntryMode::South => "南侧直道",
+            LoopEntryMode::North => "北侧直道",
+            LoopEntryMode::East => "东侧弯道",
+            LoopEntryMode::West => "西侧弯道",
+        }
+    }
+}
+
+/// 跑圈出点模式
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum LoopExitMode {
+    #[default]
+    SameAsEntry, // 同入点（跑完整数圈出圈）
+    Opposite,    // 对侧出圈（跑 N + 半圈从对侧门出圈）
+    North,       // 从北侧出圈
+    South,       // 从南侧出圈
+    East,        // 从东侧出圈
+    West,        // 从西侧出圈
+}
+
+impl LoopExitMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "opposite" => LoopExitMode::Opposite,
+            "north" => LoopExitMode::North,
+            "south" => LoopExitMode::South,
+            "east" => LoopExitMode::East,
+            "west" => LoopExitMode::West,
+            _ => LoopExitMode::SameAsEntry,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoopExitMode::SameAsEntry => "same",
+            LoopExitMode::Opposite => "opposite",
+            LoopExitMode::North => "north",
+            LoopExitMode::South => "south",
+            LoopExitMode::East => "east",
+            LoopExitMode::West => "west",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            LoopExitMode::SameAsEntry => "同入点（整圈出圈）",
+            LoopExitMode::Opposite => "对侧出圈（加半圈）",
+            LoopExitMode::North => "从北侧出圈",
+            LoopExitMode::South => "从南侧出圈",
+            LoopExitMode::East => "从东侧出圈",
+            LoopExitMode::West => "从西侧出圈",
+        }
+    }
+}
+
+/// 可调跑圈参数规格
+#[derive(Clone, Debug)]
+pub struct LoopTrackSpec {
+    /// 单圈周长（米）：如 400.0（标准田径场）、250.0、300.0 等
+    pub perimeter_m: f64,
+    /// 圈数（1..=20）
+    pub laps: usize,
+    /// 形状：true=标准操场椭圆（两直道+两半圆），false=正圆跑圈
+    pub is_oval: bool,
+    /// 走向旋转角度（度，0=南北走向长轴，90=东西走向长轴）
+    pub rotation_deg: f64,
+    /// 转向：true=逆时针左转（标准田径场规则），false=顺时针右转
+    pub counter_clockwise: bool,
+    /// 入点位置模式
+    pub entry_mode: LoopEntryMode,
+    /// 出点位置模式
+    pub exit_mode: LoopExitMode,
+}
+
+impl Default for LoopTrackSpec {
+    fn default() -> Self {
+        LoopTrackSpec {
+            perimeter_m: 400.0,
+            laps: 2,
+            is_oval: true,
+            rotation_deg: 0.0,
+            counter_clockwise: true,
+            entry_mode: LoopEntryMode::AutoClosest,
+            exit_mode: LoopExitMode::SameAsEntry,
+        }
+    }
+}
+
+/// 生成参数化跑圈控制点序列，并返回 `(points, entry_rel_idx, exit_rel_idx)`。
+pub fn generate_parametric_loop_points(
+    center: (f64, f64),
+    spec: &LoopTrackSpec,
+    prev_point: Option<(f64, f64)>,
+) -> (Vec<(f64, f64)>, usize, usize) {
+    let p = spec.perimeter_m.clamp(100.0, 2000.0);
+    let laps = spec.laps.clamp(1, 20);
+
+    // 1. 构建单圈 16 个基准局部坐标 (u, v)（u 沿长轴，v 垂直长轴）
+    let base_uv: Vec<(f64, f64)> = if spec.is_oval {
+        // 标准操场几何比例：2L + 2πR = R * (4.624 + 2π) ≈ 10.907 R
+        let r = p / (4.624 + 2.0 * std::f64::consts::PI);
+        let h = 1.156 * r; // 半直道长
+        vec![
+            // 东直道（4 点）
+            (-h * 0.5, -r),
+            (0.0, -r),
+            (h * 0.5, -r),
+            (h, -r),
+            // 北弯道半圆（4 点）
+            (h + r * 0.707, -r * 0.707),
+            (h + r, 0.0),
+            (h + r * 0.707, r * 0.707),
+            (h, r),
+            // 西直道（4 点）
+            (h * 0.5, r),
+            (0.0, r),
+            (-h * 0.5, r),
+            (-h, r),
+            // 南弯道半圆（4 点）
+            (-h - r * 0.707, r * 0.707),
+            (-h - r, 0.0),
+            (-h - r * 0.707, -r * 0.707),
+            (-h, -r),
+        ]
+    } else {
+        // 正圆跑道
+        let r = p / std::f64::consts::TAU;
+        (0..16)
+            .map(|k| {
+                let ang = k as f64 / 16.0 * std::f64::consts::TAU;
+                (r * ang.cos(), r * ang.sin())
+            })
+            .collect()
+    };
+
+    // 2. 旋转并转换为 BD-09 经纬度
+    let axis_angle = (spec.rotation_deg + 90.0).to_radians(); // 0° 时长轴指向南北向
+    let (sin_a, cos_a) = axis_angle.sin_cos();
+    let mut ring_bd: Vec<(f64, f64)> = base_uv
+        .iter()
+        .map(|&(u, v)| {
+            let x = u * cos_a - v * sin_a;
+            let y = u * sin_a + v * cos_a;
+            to_bd(x, y, center.0, center.1)
+        })
+        .collect();
+
+    // 逆时针（默认）/ 顺时针
+    if !spec.counter_clockwise {
+        ring_bd.reverse();
+    }
+
+    // 3. 定位入点索引 entry_idx (0..16)
+    let entry_idx = match spec.entry_mode {
+        LoopEntryMode::AutoClosest => {
+            if let Some(prev) = prev_point {
+                ring_bd
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        let da = ((a.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
+                            + ((a.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
+                        let db = ((b.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
+                            + ((b.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        }
+        LoopEntryMode::South => {
+            // 南侧：min(lat)
+            ring_bd
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        }
+        LoopEntryMode::North => {
+            // 北侧：max(lat)
+            ring_bd
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        }
+        LoopEntryMode::East => {
+            // 东侧：max(lon)
+            ring_bd
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        }
+        LoopEntryMode::West => {
+            // 西侧：min(lon)
+            ring_bd
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        }
+    };
+
+    // 4. 定位出点索引 exit_idx (0..16)
+    let exit_idx = match spec.exit_mode {
+        LoopExitMode::SameAsEntry => entry_idx,
+        LoopExitMode::Opposite => (entry_idx + 8) % 16,
+        LoopExitMode::North => ring_bd
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap_or(entry_idx),
+        LoopExitMode::South => ring_bd
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap_or(entry_idx),
+        LoopExitMode::East => ring_bd
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap_or(entry_idx),
+        LoopExitMode::West => ring_bd
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(idx, _)| idx)
+            .unwrap_or(entry_idx),
+    };
+
+    // 5. 组装有序路径序列：从 entry_idx 开始，跑 laps 整圈，再跑 extra 弧段直到 exit_idx
+    let m = ring_bd.len();
+    let mut out_pts = Vec::new();
+    for _ in 0..laps {
+        for k in 0..m {
+            out_pts.push(ring_bd[(entry_idx + k) % m]);
+        }
+    }
+    let extra_steps = (exit_idx + m - entry_idx) % m;
+    for k in 0..=extra_steps {
+        out_pts.push(ring_bd[(entry_idx + k) % m]);
+    }
+
+    let rel_entry_idx = 0;
+    let rel_exit_idx = out_pts.len() - 1;
+    (out_pts, rel_entry_idx, rel_exit_idx)
+}
+
+/// 在已有路径末尾无缝插入一个可调跑圈（保留前面路径！）：
+/// - 将最后一个点视为跑圈中心（弹出并替换为跑圈点列），从离上一路点最近的「入点」进场，跑足指定圈数后停在指定的「出点」；
+/// - 之后继续点击地图即可直接从「出点」接上后续的打卡点或终点。
+pub fn append_custom_loop_track(
+    waypoints: &mut Vec<(f64, f64)>,
+    fallback_center: (f64, f64),
+    spec: &LoopTrackSpec,
+) -> (usize, usize) {
+    let center = waypoints.pop().unwrap_or(fallback_center);
+    let prev = waypoints.last().copied();
+    let base_start = waypoints.len();
+    let (loop_pts, rel_entry, rel_exit) = generate_parametric_loop_points(center, spec, prev);
+    waypoints.extend(loop_pts);
+    (base_start + rel_entry, base_start + rel_exit)
+}
 /// - 若 `existing_wps` 有 1 个点：以该点为操场中心，默认南北向；
 /// - 若 `existing_wps` 有 2 个点：以两点中点为操场中心，两点连线方向为操场长轴方向；
 /// - 其他情况：以 `fallback_center` 为操场中心，默认南北向。
@@ -1185,5 +1488,37 @@ mod tests {
             dist_to_end < 35.0,
             "开环轨迹末点应停在终点附近而非跳回起点，dist_to_end={dist_to_end}m"
         );
+
+        // 测试可调跑圈生成器：自定义周长 300m、跑 2 圈、南侧入圈、北侧出圈（跑 2.5 圈）
+        let spec = LoopTrackSpec {
+            perimeter_m: 300.0,
+            laps: 2,
+            is_oval: true,
+            rotation_deg: 0.0,
+            counter_clockwise: true,
+            entry_mode: LoopEntryMode::South,
+            exit_mode: LoopExitMode::North,
+        };
+        let (loop_pts, rel_entry, rel_exit) =
+            generate_parametric_loop_points(playground_center, &spec, Some(start_pt));
+        assert_eq!(rel_entry, 0);
+        assert_eq!(rel_exit, loop_pts.len() - 1);
+        // 2 圈整 + 半圈出点弧段 = 2.5 圈，总长应接近 750m
+        let (_, arcs_loop, _) = make_ordered_path(&loop_pts, CustomCloseMode::Open);
+        let total_loop_len = *arcs_loop.last().unwrap();
+        assert!(
+            (total_loop_len - 750.0).abs() < 50.0,
+            "2.5 圈 300m 跑道总长应接近 750m，实际: {total_loop_len}m"
+        );
+
+        // 验证 append_custom_loop_track 无缝拼接到路径序列中
+        let mut full_route = vec![start_pt, playground_center];
+        let (in_idx, out_idx) =
+            append_custom_loop_track(&mut full_route, playground_center, &spec);
+        full_route.push(end_pt);
+        assert_eq!(full_route[0], start_pt);
+        assert_eq!(in_idx, 1);
+        assert_eq!(out_idx, full_route.len() - 2);
+        assert_eq!(*full_route.last().unwrap(), end_pt);
     }
 }

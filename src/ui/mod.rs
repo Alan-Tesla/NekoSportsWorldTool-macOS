@@ -363,6 +363,8 @@ impl App {
                 plan: None,
                 route_mode: crate::track::generate_road::RouteMode::from_str(&config.route_mode),
                 planned_route_km: None,
+                show_loop_designer: false,
+                special_badges: Vec::new(),
                 map: map::MapState::default(),
                 preview: None,
                 preview_stale: true,

@@ -92,9 +92,46 @@ pub struct Config {
     /// 自定义路径是否启用道路吸附与沿路网寻路（false = 自由手绘/操场跑圈模式，点哪走哪）。
     #[serde(default)]
     pub custom_snap_road: bool,
+    /// 跑圈单圈周长（米，默认 400.0）。
+    #[serde(default = "default_loop_perimeter")]
+    pub loop_perimeter: f64,
+    /// 跑圈圈数（默认 2 圈）。
+    #[serde(default = "default_loop_laps")]
+    pub loop_laps: i64,
+    /// 跑圈形状：true=标准操场椭圆，false=正圆。
+    #[serde(default = "default_true")]
+    pub loop_is_oval: bool,
+    /// 跑圈走向旋转角（度，0=南北走向）。
+    #[serde(default)]
+    pub loop_rotation_deg: f64,
+    /// 跑圈转向：true=逆时针左转（标准跑道），false=顺时针。
+    #[serde(default = "default_true")]
+    pub loop_ccw: bool,
+    /// 跑圈入点模式：auto | south | north | east | west。
+    #[serde(default = "default_loop_entry")]
+    pub loop_entry_mode: String,
+    /// 跑圈出点模式：same | opposite | north | south | east | west。
+    #[serde(default = "default_loop_exit")]
+    pub loop_exit_mode: String,
     /// 地图底图源：gaode | osm | vector。
     #[serde(default = "default_tile_source")]
     pub tile_source: String,
+}
+
+fn default_loop_perimeter() -> f64 {
+    400.0
+}
+
+fn default_loop_laps() -> i64 {
+    2
+}
+
+fn default_loop_entry() -> String {
+    "auto".into()
+}
+
+fn default_loop_exit() -> String {
+    "same".into()
 }
 
 fn default_route_mode() -> String {
@@ -154,6 +191,13 @@ impl Default for Config {
             custom_close_mode: default_custom_close_mode(),
             custom_clip_fence: true,
             custom_snap_road: false,
+            loop_perimeter: default_loop_perimeter(),
+            loop_laps: default_loop_laps(),
+            loop_is_oval: true,
+            loop_rotation_deg: 0.0,
+            loop_ccw: true,
+            loop_entry_mode: default_loop_entry(),
+            loop_exit_mode: default_loop_exit(),
             tile_source: default_tile_source(),
         }
     }

@@ -1055,8 +1055,14 @@ impl MapState {
         }
     }
 
-    /// 绘制带序号与起终点配色的途经点徽章。
-    pub fn draw_waypoints(&self, painter: &egui::Painter, rect: Rect, waypoints: &[(f64, f64)]) {
+    /// 绘制带序号、起终点及自定义特殊标记（如「入」「出」）的途经点徽章。
+    pub fn draw_waypoints_ext(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        waypoints: &[(f64, f64)],
+        special_badges: &[(usize, &str, Color32)],
+    ) {
         let clipped = painter.with_clip_rect(rect);
         let total = waypoints.len();
         for (i, &(lat, lon)) in waypoints.iter().enumerate() {
@@ -1065,14 +1071,21 @@ impl MapState {
                 continue;
             }
             let is_active = self.dragging_wp == Some(i) || self.hover_wp == Some(i);
-            let fill = if i == 0 {
-                Color32::from_rgb(22, 160, 90)
+            let special = special_badges.iter().find(|(idx, _, _)| *idx == i);
+            let (fill, text) = if let Some((_, tag, color)) = special {
+                (*color, tag.to_string())
+            } else if i == 0 {
+                (Color32::from_rgb(22, 160, 90), "起".to_string())
             } else if i + 1 == total {
-                Color32::from_rgb(220, 50, 47)
+                (Color32::from_rgb(220, 50, 47), format!("{}", i + 1))
             } else {
-                Color32::from_rgb(30, 111, 216)
+                (Color32::from_rgb(30, 111, 216), format!("{}", i + 1))
             };
-            let radius = if is_active { 10.5 } else { 8.5 };
+            let radius = if is_active || special.is_some() {
+                10.5
+            } else {
+                8.5
+            };
             if is_active {
                 clipped.circle_stroke(
                     pos,
@@ -1085,11 +1098,6 @@ impl MapState {
             }
             clipped.circle_filled(pos, radius, fill);
             clipped.circle_stroke(pos, radius, Stroke::new(1.8_f32, Color32::WHITE));
-            let text = if i == 0 {
-                "起".to_string()
-            } else {
-                format!("{}", i + 1)
-            };
             clipped.text(
                 pos,
                 Align2::CENTER_CENTER,
@@ -1131,6 +1139,12 @@ impl MapState {
                 }
             }
         }
+    }
+
+    /// 绘制常规途经点徽章（起点绿、末点红、中间蓝序号）。
+    #[allow(dead_code)]
+    pub fn draw_waypoints(&self, painter: &egui::Painter, rect: Rect, waypoints: &[(f64, f64)]) {
+        self.draw_waypoints_ext(painter, rect, waypoints, &[]);
     }
 
     /// 在地图左下角绘制自适应米制比例尺。

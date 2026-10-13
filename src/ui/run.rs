@@ -7,8 +7,9 @@
 use super::map::{collect_scene_bounds, MapState, TileSource};
 use super::{mobile, theme, App};
 use crate::track::generate_road::{
-    append_playground_laps, plan_custom_view, repeat_last_loop, snap_point_to_aligned_road,
-    CustomCloseMode, RouteMode,
+    append_custom_loop_track, append_playground_laps, plan_custom_view, repeat_last_loop,
+    snap_point_to_aligned_road, CustomCloseMode, LoopEntryMode, LoopExitMode, LoopTrackSpec,
+    RouteMode,
 };
 use chrono::{Datelike, Duration, Local, TimeZone, Timelike};
 use eframe::egui;
@@ -84,6 +85,10 @@ pub struct RunPage {
     pub route_mode: RouteMode,
     /// 自定义规划路径的实际几何长度（km），用于在 Custom 模式下自动对齐方案距离与「换一版」抽样
     pub planned_route_km: Option<f64>,
+    /// 是否展开跑圈设计器面板
+    pub show_loop_designer: bool,
+    /// 特殊途经点徽章（如跑圈的「入」「出」标记）
+    pub special_badges: Vec<(usize, String, egui::Color32)>,
     /// 地图视图状态
     pub map: MapState,
     /// 路网预览（真实道路路由）
@@ -653,8 +658,10 @@ impl App {
                     "",
                     " 圈",
                 );
+                ui.toggle_value(&mut self.run_page.show_loop_designer, "⚙ 跑圈设计器")
+                    .on_hover_text("展开/收起跑圈参数面板（单圈周长、圈数、椭圆/正圆、旋转走向、入点与出点）");
                 if ui
-                    .small_button("＋插入操场跑圈")
+                    .small_button("＋标准400m操场圈")
                     .on_hover_text(
                         "保留前面路线！在操场中心点一下后点击，自动在当前位置接上 N 圈 400m 跑道，之后可继续点选下一个点位",
                     )
@@ -707,6 +714,7 @@ impl App {
                     .clicked()
                 {
                     self.config.custom_waypoints.clear();
+                    self.run_page.special_badges.clear();
                     need_sync = true;
                 }
                 if ui.small_button("居中").clicked() {
@@ -716,6 +724,150 @@ impl App {
                     open_big_map = true;
                 }
             });
+
+            // 跑步页跑圈参数设计器展开面板
+            if self.run_page.show_loop_designer {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("跑圈参数：");
+                        ui.label("单圈周长：");
+                        for &preset in &[400.0, 300.0, 250.0, 200.0] {
+                            if ui
+                                .selectable_label(
+                                    (self.config.loop_perimeter - preset).abs() < 1.0,
+                                    format!("{preset:.0}m"),
+                                )
+                                .clicked()
+                            {
+                                self.config.loop_perimeter = preset;
+                                need_sync = true;
+                            }
+                        }
+                        mobile::drag_f64(
+                            ui,
+                            "run_loop_perim_drag",
+                            &mut self.config.loop_perimeter,
+                            100.0..=1500.0,
+                            5.0,
+                            0,
+                        );
+                        ui.label("m");
+                        ui.separator();
+                        ui.label("圈数：");
+                        mobile::drag_i64(
+                            ui,
+                            "run_loop_laps_drag",
+                            &mut self.config.loop_laps,
+                            1..=20,
+                            0.2,
+                            "",
+                            " 圈",
+                        );
+                        ui.separator();
+                        ui.label("形状：");
+                        ui.selectable_value(&mut self.config.loop_is_oval, true, "标准椭圆");
+                        ui.selectable_value(&mut self.config.loop_is_oval, false, "正圆");
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("走向：");
+                        ui.selectable_value(&mut self.config.loop_rotation_deg, 0.0, "南北 0°");
+                        ui.selectable_value(&mut self.config.loop_rotation_deg, 90.0, "东西 90°");
+                        mobile::drag_f64(
+                            ui,
+                            "run_loop_rot_drag",
+                            &mut self.config.loop_rotation_deg,
+                            -180.0..=180.0,
+                            1.0,
+                            0,
+                        );
+                        ui.label("°");
+                        ui.separator();
+                        ui.label("转向：");
+                        ui.selectable_value(&mut self.config.loop_ccw, true, "逆时针左转");
+                        ui.selectable_value(&mut self.config.loop_ccw, false, "顺时针右转");
+                        ui.separator();
+                        let mut entry_mode = LoopEntryMode::from_str(&self.config.loop_entry_mode);
+                        let prev_entry = entry_mode;
+                        ui.label("入点：");
+                        egui::ComboBox::from_id_salt("run_entry_mode")
+                            .width(115.0)
+                            .selected_text(entry_mode.label())
+                            .show_ui(ui, |ui| {
+                                for m in [
+                                    LoopEntryMode::AutoClosest,
+                                    LoopEntryMode::South,
+                                    LoopEntryMode::North,
+                                    LoopEntryMode::East,
+                                    LoopEntryMode::West,
+                                ] {
+                                    ui.selectable_value(&mut entry_mode, m, m.label());
+                                }
+                            });
+                        if entry_mode != prev_entry {
+                            self.config.loop_entry_mode = entry_mode.as_str().into();
+                            need_sync = true;
+                        }
+
+                        let mut exit_mode = LoopExitMode::from_str(&self.config.loop_exit_mode);
+                        let prev_exit = exit_mode;
+                        ui.label("出点：");
+                        egui::ComboBox::from_id_salt("run_exit_mode")
+                            .width(135.0)
+                            .selected_text(exit_mode.label())
+                            .show_ui(ui, |ui| {
+                                for m in [
+                                    LoopExitMode::SameAsEntry,
+                                    LoopExitMode::Opposite,
+                                    LoopExitMode::North,
+                                    LoopExitMode::South,
+                                    LoopExitMode::East,
+                                    LoopExitMode::West,
+                                ] {
+                                    ui.selectable_value(&mut exit_mode, m, m.label());
+                                }
+                            });
+                        if exit_mode != prev_exit {
+                            self.config.loop_exit_mode = exit_mode.as_str().into();
+                            need_sync = true;
+                        }
+
+                        if ui
+                            .add(theme::primary_btn("＋插入跑圈"))
+                            .on_hover_text("在末点无缝插入自定义跑圈（标出「入」和「出」特殊标记）")
+                            .clicked()
+                        {
+                            let spec = LoopTrackSpec {
+                                perimeter_m: self.config.loop_perimeter,
+                                laps: self.config.loop_laps.clamp(1, 20) as usize,
+                                is_oval: self.config.loop_is_oval,
+                                rotation_deg: self.config.loop_rotation_deg,
+                                counter_clockwise: self.config.loop_ccw,
+                                entry_mode,
+                                exit_mode,
+                            };
+                            let fallback = if self.run_page.map.center != (0.0, 0.0) {
+                                self.run_page.map.center
+                            } else {
+                                (self.identity.anchor_lat, self.identity.anchor_lon)
+                            };
+                            let (entry_idx, exit_idx) = append_custom_loop_track(
+                                &mut self.config.custom_waypoints,
+                                fallback,
+                                &spec,
+                            );
+                            self.run_page.special_badges = vec![
+                                (entry_idx, "入".into(), egui::Color32::from_rgb(16, 185, 129)),
+                                (exit_idx, "出".into(), egui::Color32::from_rgb(249, 115, 22)),
+                            ];
+                            self.osm_page.special_badges = self.run_page.special_badges.clone();
+                            self.config.custom_snap_road = false;
+                            self.osm_page.snap_road = false;
+                            need_sync = true;
+                        }
+                    });
+                });
+            }
 
             if close_mode != prev_close {
                 self.config.custom_close_mode = close_mode.as_str().into();
@@ -938,9 +1090,15 @@ impl App {
                     .draw_route_with_arrows(&painter, canvas, &p.route, route_c, 2.8);
             }
             if is_custom {
+                let badges: Vec<(usize, &str, egui::Color32)> = self
+                    .run_page
+                    .special_badges
+                    .iter()
+                    .map(|(idx, s, c)| (*idx, s.as_str(), *c))
+                    .collect();
                 self.run_page
                     .map
-                    .draw_waypoints(&painter, canvas, &self.config.custom_waypoints);
+                    .draw_waypoints_ext(&painter, canvas, &self.config.custom_waypoints, &badges);
             } else {
                 if let Some(first) = p.route.first() {
                     self.run_page.map.draw_point(
