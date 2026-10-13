@@ -331,6 +331,7 @@ impl App {
                 target_dist_m,
                 seed,
             );
+            self.run_page.sync_planned_route_len(plan.length_m);
             self.osm_page.preview = Some(plan);
         }
 

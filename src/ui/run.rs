@@ -82,6 +82,8 @@ pub struct RunPage {
     pub plan: Option<RunPlan>,
     /// 路线算法模式
     pub route_mode: RouteMode,
+    /// 自定义规划路径的实际几何长度（km），用于在 Custom 模式下自动对齐方案距离与「换一版」抽样
+    pub planned_route_km: Option<f64>,
     /// 地图视图状态
     pub map: MapState,
     /// 路网预览（真实道路路由）
@@ -99,6 +101,7 @@ pub struct RunPlan {
     pub dist_max: f32,
     pub pace_min: f32,
     pub pace_max: f32,
+    pub planned_route_km: Option<f64>,
     pub start_mode: usize,
     pub days_ago: i64,
     pub hour: i64,
@@ -115,12 +118,53 @@ pub struct RunPlan {
 }
 
 impl RunPage {
+    /// 当前是否由自定义规划路径决定跑步里程。
+    fn effective_custom_km(&self) -> Option<f64> {
+        if self.route_mode == RouteMode::Custom {
+            self.planned_route_km.filter(|&k| k > 0.05)
+        } else {
+            None
+        }
+    }
+
+    /// 当地图规划出新的路线长度（米）时，同步更新 `planned_route_km` 并即时刷新当前方案的里程与用时。
+    pub fn sync_planned_route_len(&mut self, length_m: f64) {
+        let new_km = if length_m > 50.0 {
+            Some(length_m / 1000.0)
+        } else {
+            None
+        };
+        let prev_km = self.planned_route_km;
+        self.planned_route_km = new_km;
+
+        if self.route_mode == RouteMode::Custom {
+            let changed = match (prev_km, new_km) {
+                (Some(a), Some(b)) => (a - b).abs() >= 1e-4,
+                (None, None) => false,
+                _ => true,
+            };
+            if changed {
+                let (dist, pace, dur) = self.sample_shape();
+                let start_ms = match (&self.plan, self.start_mode) {
+                    (Some(p), 0) => p.start_ms.min(Self::latest_start_ms(dur)),
+                    _ => self.pick_time(),
+                };
+                let stale = self.preview_stale;
+                self.write_plan(dist, pace, dur, start_ms);
+                self.preview_stale = stale;
+            }
+        }
+    }
+
     /// 距离/配速是否与方案一致（不一致需重掷运动参数）。
     fn shape_matches(&self, p: &RunPlan) -> bool {
-        p.dist_min == self.dist_min
-            && p.dist_max == self.dist_max
-            && p.pace_min == self.pace_min
-            && p.pace_max == self.pace_max
+        let custom_km = self.effective_custom_km();
+        let dist_ok = match (custom_km, p.planned_route_km) {
+            (Some(a), Some(b)) => (a - b).abs() < 1e-4,
+            (None, None) => p.dist_min == self.dist_min && p.dist_max == self.dist_max,
+            _ => false,
+        };
+        dist_ok && p.pace_min == self.pace_min && p.pace_max == self.pace_max
     }
 
     /// 开始时间控件是否与方案一致。
@@ -149,7 +193,14 @@ impl RunPage {
             self.pace_min.max(self.pace_max),
         );
         let pace = plo + (phi - plo) * rand::random::<f32>();
-        let dist = (lo + (hi - lo) * rand::random::<f32>()) as f64;
+        let dist = match self.effective_custom_km() {
+            Some(rkm) => {
+                // 自定义规划路径模式下，围绕所画路线的真实长度做 ±1.2% 的真人 GPS 级微幅波动
+                let jitter = 0.988 + 0.024 * rand::random::<f64>();
+                (rkm * jitter).max(0.05)
+            }
+            None => (lo + (hi - lo) * rand::random::<f32>()) as f64,
+        };
         let dur = (dist * pace as f64).round() as i64;
         (dist, pace, dur)
     }
@@ -205,6 +256,7 @@ impl RunPage {
             dist_max: self.dist_max,
             pace_min: self.pace_min,
             pace_max: self.pace_max,
+            planned_route_km: self.effective_custom_km(),
             start_mode: self.start_mode,
             days_ago: self.days_ago,
             hour: self.hour,
@@ -275,25 +327,36 @@ impl App {
             let page = &mut self.run_page;
             let compact = mobile::compact_ui(ui);
             let mut draw_distance_inputs = |ui: &mut egui::Ui| {
-                mobile::drag_f32(
-                    ui,
-                    "run_dist_min",
-                    &mut page.dist_min,
-                    0.5..=20.0,
-                    0.05,
-                    2,
-                    " km",
-                );
-                ui.label("至");
-                mobile::drag_f32(
-                    ui,
-                    "run_dist_max",
-                    &mut page.dist_max,
-                    0.5..=20.0,
-                    0.05,
-                    2,
-                    " km",
-                );
+                if let Some(rkm) = page.effective_custom_km() {
+                    ui.colored_label(
+                        theme::ok(),
+                        format!(
+                            "跟随规划路径 {:.2} km（约 {:.0} m，「换一版」在此长度 ±1.2% 内微幅浮动）",
+                            rkm,
+                            rkm * 1000.0
+                        ),
+                    );
+                } else {
+                    mobile::drag_f32(
+                        ui,
+                        "run_dist_min",
+                        &mut page.dist_min,
+                        0.5..=20.0,
+                        0.05,
+                        2,
+                        " km",
+                    );
+                    ui.label("至");
+                    mobile::drag_f32(
+                        ui,
+                        "run_dist_max",
+                        &mut page.dist_max,
+                        0.5..=20.0,
+                        0.05,
+                        2,
+                        " km",
+                    );
+                }
             };
             if compact {
                 ui.label("距离范围（km）：");
@@ -717,7 +780,9 @@ impl App {
                 if let Some(err) = &p.route_error {
                     self.status = err.clone();
                 }
+                let len_m = p.length_m;
                 self.run_page.preview = Some(p);
+                self.run_page.sync_planned_route_len(len_m);
             } else if let Some(net) = self.network.clone() {
                 self.run_page.map_fitted = false;
                 if !pts_bd.is_empty() {
@@ -1463,6 +1528,40 @@ mod tests {
         assert!(
             !p.random_window_ok(),
             "今天 03:00 不应被判为在 7:00-20:00 窗口内"
+        );
+    }
+
+    /// 自定义规划路径模式下，方案距离与「换一版」应始终跟随规划路线长度（±1.5% 内微幅浮动），
+    /// 而非被固定的 dist_min..dist_max 范围绑死。
+    #[test]
+    fn custom_route_len_syncs_plan_and_shuffle_stays_matched() {
+        let mut p = page(0, 1);
+        p.dist_min = 1.0;
+        p.dist_max = 1.2;
+        p.route_mode = RouteMode::Custom;
+        p.sync_planned_route_len(2650.0); // 规划了一条 2.65 km 的路线
+        p.ensure_plan();
+
+        let mut seen_paces = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let plan = p.plan.as_ref().unwrap();
+            assert!(
+                (plan.dist - 2.65).abs() < 0.05,
+                "自定义规划路线 2.65km 时方案距离 {} 未对齐",
+                plan.dist
+            );
+            seen_paces.insert(plan.pace.to_bits());
+            p.regen_plan();
+        }
+        assert!(seen_paces.len() > 1, "「换一版」应继续重抽配速与用时");
+
+        // 拖动途经点使路线变为 3.40 km 时，方案距离应立即自动跟随到 3.40 km 附近
+        p.sync_planned_route_len(3400.0);
+        let plan = p.plan.as_ref().unwrap();
+        assert!(
+            (plan.dist - 3.40).abs() < 0.06,
+            "修改路线长度后方案距离 {} 未同步到 3.40km",
+            plan.dist
         );
     }
 }
