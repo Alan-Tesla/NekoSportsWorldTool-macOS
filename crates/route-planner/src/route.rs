@@ -310,8 +310,10 @@ pub fn path_coords(g: &RoadGraph, path: &[NodeIndex]) -> Vec<Coord> {
 /// 自定义路径的闭合/延展方式。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum CustomCloseMode {
-    /// 闭合环线：按序连接全部途经点后，沿最短道路回到起点形成闭环。
+    /// 开环单程：从起点按序经过全部途经点（可含中间跑圈段）直接到终点结束，首尾不闭合。
     #[default]
+    Open,
+    /// 闭合环线：按序连接全部途经点后，沿最短道路回到起点形成闭环。
     Loop,
     /// 原路折返：按序从起点到终点，再沿原路返回起点（往返闭合）。
     OutAndBack,
@@ -322,14 +324,16 @@ pub enum CustomCloseMode {
 impl CustomCloseMode {
     pub fn from_str(s: &str) -> Self {
         match s {
+            "loop" => CustomCloseMode::Loop,
             "out_and_back" => CustomCloseMode::OutAndBack,
             "auto_pad" => CustomCloseMode::AutoPadLoop,
-            _ => CustomCloseMode::Loop,
+            _ => CustomCloseMode::Open,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
+            CustomCloseMode::Open => "open",
             CustomCloseMode::Loop => "loop",
             CustomCloseMode::OutAndBack => "out_and_back",
             CustomCloseMode::AutoPadLoop => "auto_pad",
@@ -338,10 +342,15 @@ impl CustomCloseMode {
 
     pub fn label(self) -> &'static str {
         match self {
+            CustomCloseMode::Open => "开环单程（起点→终点，不闭合）",
             CustomCloseMode::Loop => "闭合环线（自动回起点）",
             CustomCloseMode::OutAndBack => "原路折返（往返路线）",
             CustomCloseMode::AutoPadLoop => "自动凑距闭环（必经+游走）",
         }
+    }
+
+    pub fn is_closed(self) -> bool {
+        !matches!(self, CustomCloseMode::Open)
     }
 }
 
@@ -367,7 +376,7 @@ pub fn plan_custom_nodes(
         return plan_loop(g, start, &must, &[], target_len_m, seed, opts);
     }
     if vnodes.len() < 2 {
-        return Err("请至少在地图上添加 2 个途经点（或切换为「自动凑距闭环」）".into());
+        return Err("请至少在地图上添加 2 个途经点".into());
     }
 
     let mut forward = vec![start];
@@ -378,7 +387,7 @@ pub fn plan_custom_nodes(
         }
         let seg = shortest_path(g, cur, target).ok_or_else(|| {
             format!(
-                "途经点 #{} → #{} 之间道路不连通（请检查是否跨围栏或断头路）",
+                "途经点 #{} → #{} 之间道路不连通（请检查是否跨围栏或断头路，或切换为「自由手绘/操场」）",
                 idx,
                 idx + 1
             )
@@ -392,10 +401,11 @@ pub fn plan_custom_nodes(
     }
 
     match mode {
+        CustomCloseMode::Open => Ok(forward),
         CustomCloseMode::Loop => {
             if cur != start {
                 let back = shortest_path(g, cur, start)
-                    .ok_or_else(|| "终点无法沿道路回到起点，请调整途经点或改用「原路折返」".to_string())?;
+                    .ok_or_else(|| "终点无法沿道路回到起点，请调整途经点或改用「开环单程」".to_string())?;
                 forward.extend(back.into_iter().skip(1));
             }
             Ok(forward)

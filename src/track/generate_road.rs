@@ -10,8 +10,8 @@
 
 use super::generator::{SPEED_CEIL, SPEED_FLOOR};
 use super::geom::{
-    fmt_gain_time, make_ordered_ring, ring_point_at, round_to, to_bd, wgs84_to_bd09, Rng,
-    MET_PER_DEG_LAT, MET_PER_DEG_LNG,
+    fmt_gain_time, make_ordered_path, open_point_at, ring_point_at, round_to, to_bd,
+    wgs84_to_bd09, Rng, MET_PER_DEG_LAT, MET_PER_DEG_LNG,
 };
 use super::model::{GenPoint, Segment, TenWindow, Track};
 use super::postfix::apply_post_fixes;
@@ -272,7 +272,7 @@ pub fn plan_custom_view(
         }
     }
 
-    // 模式 2：自由手绘 / 操场跑圈模式（不强制吸附道路，严格經過用户点击的每个点）
+    // 模式 2：自由手绘 / 操场跑圈模式（不强制吸附道路，严格经过用户点击的每个点）
     if waypoints_bd.len() < 2 {
         return RoadPlan {
             route: waypoints_bd.to_vec(),
@@ -286,19 +286,20 @@ pub fn plan_custom_view(
             checkpoints: ordered_cp,
             fences: fences.to_vec(),
             route_error: Some(
-                "自由手绘/操场模式：左键点击任意位置（如操场跑道）添加至少 2 个点，或点「生成操场跑圈」"
+                "左键点击地图添加起点与途经点（可在中间点选操场位置后点「+追加操场跑圈」，再去往下一途经点）"
                     .into(),
             ),
         };
     }
-    let close_loop = close_mode != CustomCloseMode::OutAndBack;
-    let (dense, arcs, (cx, cy)) = make_ordered_ring(waypoints_bd, close_loop);
+    let (dense, arcs, (cx, cy)) = make_ordered_path(waypoints_bd, close_mode);
     let mut route_pts: Vec<(f64, f64)> = dense
         .iter()
         .map(|&(x, y)| to_bd(x, y, cx, cy))
         .collect();
-    if let Some(&first) = route_pts.first() {
-        route_pts.push(first);
+    if close_mode.is_closed() {
+        if let Some(&first) = route_pts.first() {
+            route_pts.push(first);
+        }
     }
     let length_m = *arcs.last().unwrap_or(&0.0);
     RoadPlan {
@@ -313,6 +314,90 @@ pub fn plan_custom_view(
         checkpoints: ordered_cp,
         fences: fences.to_vec(),
         route_error: None,
+    }
+}
+
+/// 在当前路径序列中追加 `laps` 圈标准 400m 田径操场跑道（保留已有前后开环路段！）：
+/// - 若 `waypoints` 非空，则将最后一个点视为用户刚点下的「操场中心定位点」（弹出并替换为跑道圈点列），
+///   且自动从离前一个路径点最近的跑道切入点进场，跑完 `laps` 圈后停在该切出点，方便后续继续点选出操场后的第 2 个目标点位；
+/// - 若 `waypoints` 为空，则以 `fallback_center` 为中心生成 `laps` 圈跑道。
+pub fn append_playground_laps(
+    waypoints: &mut Vec<(f64, f64)>,
+    fallback_center: (f64, f64),
+    laps: usize,
+) {
+    let laps = laps.clamp(1, 20);
+    let center = waypoints.pop().unwrap_or(fallback_center);
+    let base_oval = make_playground_oval(&[center], center);
+    if base_oval.is_empty() {
+        return;
+    }
+
+    // 若前面已有路径点（例如起点/第一打卡点），选择离前一点最近的跑道点作为切入/切出点
+    let start_idx = if let Some(&prev) = waypoints.last() {
+        base_oval
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = ((a.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
+                    + ((a.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
+                let db = ((b.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
+                    + ((b.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let m = base_oval.len();
+    for _ in 0..laps {
+        for k in 0..m {
+            waypoints.push(base_oval[(start_idx + k) % m]);
+        }
+    }
+    // 闭合最后一圈回到切出点，方便无缝继续跑向下一个点位
+    waypoints.push(base_oval[start_idx]);
+}
+
+/// 将用户手动在操场/环线上点出的最近一圈路径点再原地复制追加一圈（保留前面的进场路段）。
+///
+/// 自动在末尾 3..=16 个点中寻找与末点距离最近（或默认取最近 4~8 个点）的一圈并追加。
+pub fn repeat_last_loop(waypoints: &mut Vec<(f64, f64)>) -> bool {
+    let n = waypoints.len();
+    if n < 3 {
+        return false;
+    }
+    let last = waypoints[n - 1];
+    // 在倒数第 3 到倒数第 14 个点之间寻找与末点距离 < 90m 的闭环起点
+    let max_back = (n - 1).min(14);
+    let mut loop_start: Option<usize> = None;
+    let mut best_d = 90.0 * 90.0;
+    for back in 3..=max_back {
+        let idx = n - 1 - back;
+        let p = waypoints[idx];
+        let d2 = ((p.0 - last.0) * MET_PER_DEG_LAT).powi(2)
+            + ((p.1 - last.1) * MET_PER_DEG_LNG).powi(2);
+        if d2 < best_d {
+            best_d = d2;
+            loop_start = Some(idx);
+        }
+    }
+
+    if let Some(start_idx) = loop_start {
+        // 已闭合一圈（start_idx .. n-1），复制 (start_idx + 1)..n 追加一圈
+        let seg: Vec<(f64, f64)> = waypoints[start_idx + 1..n].to_vec();
+        waypoints.extend(seg);
+        true
+    } else {
+        // 用户刚绕操场点了 k 个点尚未闭合回本圈起点：取最近 min(n, 6) 个点先闭合再绕一圈
+        let k = n.min(6);
+        let start_idx = n - k;
+        let mut seg: Vec<(f64, f64)> = waypoints[start_idx..n].to_vec();
+        seg.push(waypoints[start_idx]);
+        waypoints.extend(seg);
+        true
     }
 }
 
@@ -521,7 +606,9 @@ pub fn build_road(
     let waypoints: Vec<Coord> = route_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
     let must: Vec<Coord> = must_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
     let route = plan_route_split(net, &waypoints, &must, dist, seed, &opts)?;
-    build_track_from_route(dist, dur, seed, start_ms, &route, route_bd, route_bd, net)
+    build_track_from_route(
+        dist, dur, seed, start_ms, &route, route_bd, route_bd, true, net,
+    )
 }
 
 /// 模式 C（有 OSM 路网）：按用户自定义途经点在真实路网上规划路线并生成完整协议轨迹。
@@ -555,6 +642,7 @@ pub fn build_custom_road(
         &route,
         waypoints_bd,
         snap_bd,
+        close_mode.is_closed(),
         net,
     )
 }
@@ -568,6 +656,7 @@ fn build_track_from_route(
     route: &Route,
     ref_bd: &[(f64, f64)],
     snap_bd: &[(f64, f64)],
+    closed: bool,
     net: &RoadGraph,
 ) -> Result<Track, String> {
     let mut rng = Rng::new(seed);
@@ -581,6 +670,12 @@ fn build_track_from_route(
         ref_bd.iter().map(|q| q.1).sum::<f64>() / n_pts as f64,
     );
     let (dense, arcs) = route_ring(route, c_lat, c_lng);
+    let total_arc = (*arcs.last().unwrap_or(&dist)).max(1.0);
+    let arc_scale = if !closed && dist > 1.0 {
+        total_arc / dist
+    } else {
+        1.0
+    };
 
     // 时间网格（同经典模式）
     let mut times = Vec::new();
@@ -700,7 +795,13 @@ fn build_track_from_route(
         let dt = dts[i];
         let (typ, lt) = kinds[i];
         t_acc += dt;
-        let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
+        let pos = |ss: f64| {
+            if closed {
+                ring_point_at(&dense, &arcs, ss)
+            } else {
+                open_point_at(&dense, &arcs, ss * arc_scale)
+            }
+        };
         let mut d_step = 0.0f64;
         let px;
         let py;
@@ -1027,5 +1128,56 @@ mod tests {
         );
         assert!((track.totalDistance - 1500.0).abs() < 1.0);
         assert!(!track.locations.is_empty());
+
+        // 测试「点位 1 → 插入操场 2 圈 → 点位 2（开环单程模式，首尾不闭合）」
+        let start_pt = (38.887000, 121.529000);
+        let playground_center = (38.889000, 121.531000);
+        let end_pt = (38.891500, 121.534000);
+        let mut mixed_wps = vec![start_pt, playground_center];
+        append_playground_laps(&mut mixed_wps, playground_center, 2);
+        mixed_wps.push(end_pt);
+        assert_eq!(mixed_wps.first().copied(), Some(start_pt));
+        assert_eq!(mixed_wps.last().copied(), Some(end_pt));
+
+        let open_view = plan_custom_view(
+            None,
+            &mixed_wps,
+            &[start_pt, end_pt],
+            &[],
+            false,
+            false,
+            CustomCloseMode::Open,
+            1500.0,
+            7,
+        );
+        assert!(open_view.route_error.is_none());
+        let first_r = open_view.route.first().unwrap();
+        let last_r = open_view.route.last().unwrap();
+        assert!(
+            (first_r.0 - start_pt.0).abs() < 1e-5 && (first_r.1 - start_pt.1).abs() < 1e-5,
+            "开环路线起点应等于点位 1"
+        );
+        assert!(
+            (last_r.0 - end_pt.0).abs() < 1e-5 && (last_r.1 - end_pt.1).abs() < 1e-5,
+            "开环路线终点应等于点位 2，不应闭合回点位 1"
+        );
+
+        let open_track = crate::track::generator::build_ordered_mode(
+            open_view.length_m,
+            540,
+            7,
+            1_700_000_000_000,
+            &mixed_wps,
+            CustomCloseMode::Open,
+            &[start_pt, end_pt],
+        );
+        let last_loc = open_track.locations.last().unwrap();
+        let dist_to_end = (((last_loc.gLat - end_pt.0) * MET_PER_DEG_LAT).powi(2)
+            + ((last_loc.gLng - end_pt.1) * MET_PER_DEG_LNG).powi(2))
+        .sqrt();
+        assert!(
+            dist_to_end < 35.0,
+            "开环轨迹末点应停在终点附近而非跳回起点，dist_to_end={dist_to_end}m"
+        );
     }
 }

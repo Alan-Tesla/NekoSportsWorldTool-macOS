@@ -7,8 +7,8 @@
 #![allow(non_snake_case)]
 
 use super::geom::{
-    fmt_gain_time, make_ordered_ring, make_point_ring, ring_point_at, round_to, to_bd, Rng,
-    MET_PER_DEG_LAT, MET_PER_DEG_LNG,
+    fmt_gain_time, make_ordered_path, make_point_ring, open_point_at, ring_point_at, round_to,
+    to_bd, Rng, MET_PER_DEG_LAT, MET_PER_DEG_LNG,
 };
 use super::model::{GenPoint, Segment, TenWindow, Track};
 use super::postfix::apply_post_fixes;
@@ -45,10 +45,13 @@ pub fn build(
     points_bd: &[(f64, f64)],
 ) -> Track {
     let (dense, arcs, pc) = make_point_ring(points_bd);
-    build_from_ring(dist, dur, seed, start_ms, &dense, &arcs, pc, false, points_bd)
+    build_from_ring(
+        dist, dur, seed, start_ms, &dense, &arcs, pc, false, true, points_bd,
+    )
 }
 
-/// 无路网自定义途经点轨迹生成：严格按用户指定点序与起点（`s=0, direction=+1`）生成，并对打卡点吸附。
+/// 无路网自定义途经点轨迹生成（兼容布尔闭合标志）。
+#[allow(dead_code)]
 pub fn build_ordered(
     dist: f64,
     dur: i64,
@@ -58,10 +61,40 @@ pub fn build_ordered(
     close_loop: bool,
     snap_bd: &[(f64, f64)],
 ) -> Track {
-    let (dense, arcs, pc) = make_ordered_ring(ordered_bd, close_loop);
-    build_from_ring(dist, dur, seed, start_ms, &dense, &arcs, pc, true, snap_bd)
+    let mode = if close_loop {
+        route_planner::CustomCloseMode::Loop
+    } else {
+        route_planner::CustomCloseMode::OutAndBack
+    };
+    build_ordered_mode(dist, dur, seed, start_ms, ordered_bd, mode, snap_bd)
 }
 
+/// 按自定义闭合模式（含 `Open` 开环单程、`Loop` 闭合环线、`OutAndBack` 原路折返）生成轨迹。
+pub fn build_ordered_mode(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    ordered_bd: &[(f64, f64)],
+    mode: route_planner::CustomCloseMode,
+    snap_bd: &[(f64, f64)],
+) -> Track {
+    let (dense, arcs, pc) = make_ordered_path(ordered_bd, mode);
+    build_from_ring(
+        dist,
+        dur,
+        seed,
+        start_ms,
+        &dense,
+        &arcs,
+        pc,
+        true,
+        mode.is_closed(),
+        snap_bd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_from_ring(
     dist: f64,
     dur: i64,
@@ -71,6 +104,7 @@ fn build_from_ring(
     arcs: &[f64],
     pc: (f64, f64),
     pin_start: bool,
+    closed: bool,
     points_bd: &[(f64, f64)],
 ) -> Track {
     let mut rng = Rng::new(seed);
@@ -85,6 +119,12 @@ fn build_from_ring(
         0.0
     } else {
         rng.uniform(0.0, *arcs.last().unwrap_or(&400.0))
+    };
+    let total_arc = (*arcs.last().unwrap_or(&dist)).max(1.0);
+    let arc_scale = if !closed && dist > 1.0 {
+        total_arc / dist
+    } else {
+        1.0
     };
     let phase_v = rng.uniform(0.0, std::f64::consts::TAU);
     let phase_l = rng.uniform(0.0, std::f64::consts::TAU);
@@ -201,7 +241,13 @@ fn build_from_ring(
         let dt = dts[i];
         let (typ, lt) = kinds[i];
         t_acc += dt;
-        let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
+        let pos = |ss: f64| {
+            if closed {
+                ring_point_at(dense, arcs, ss)
+            } else {
+                open_point_at(dense, arcs, ss * arc_scale)
+            }
+        };
         let mut d_step = 0.0f64;
         let px;
         let py;

@@ -76,52 +76,116 @@ pub fn make_point_ring(bd_points: &[(f64, f64)]) -> PointRing {
     build_catmull_ring(&ordered, cx, cy)
 }
 
-/// 按用户给定的点序（不重排角度）构建闭合或折返平面路径 + 弧长表 + 中心。
+/// 按用户给定的点序（不重排角度）构建闭合环线或往返折返平面路径 + 弧长表 + 中心。
+#[allow(dead_code)]
 pub fn make_ordered_ring(bd_points: &[(f64, f64)], close_loop: bool) -> PointRing {
+    let mode = if close_loop {
+        route_planner::CustomCloseMode::Loop
+    } else {
+        route_planner::CustomCloseMode::OutAndBack
+    };
+    make_ordered_path(bd_points, mode)
+}
+
+/// 按用户给定的点序和闭合模式（支持 `Open` 开环单程、`Loop` 闭合环线、`OutAndBack` 原路折返）
+/// 构建平面采样路径 + 弧长表 + 中心。
+pub fn make_ordered_path(
+    bd_points: &[(f64, f64)],
+    mode: route_planner::CustomCloseMode,
+) -> PointRing {
     let n = bd_points.len();
     if n == 0 {
-        return ( vec![(0.0, 0.0)], vec![0.0, 1.0], (0.0, 0.0) );
+        return (vec![(0.0, 0.0)], vec![0.0, 1.0], (0.0, 0.0));
     }
     let cx = bd_points.iter().map(|q| q.0).sum::<f64>() / n as f64;
     let cy = bd_points.iter().map(|q| q.1).sum::<f64>() / n as f64;
     if n == 1 {
         return (vec![(0.0, 0.0)], vec![0.0, 1.0], (cx, cy));
     }
-    if !close_loop {
-        // 原路折返：正向折线分段采样 + 反向折返闭合
-        let plane: Vec<(f64, f64)> = bd_points
-            .iter()
-            .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
-            .collect();
-        let samples = 18usize;
-        let mut dense = Vec::new();
-        for w in plane.windows(2) {
-            for j in 0..samples {
-                let t = j as f64 / samples as f64;
-                dense.push((
-                    w[0].0 + (w[1].0 - w[0].0) * t,
-                    w[0].1 + (w[1].1 - w[0].1) * t,
-                ));
+    match mode {
+        route_planner::CustomCloseMode::Open => build_open_catmull(bd_points, cx, cy),
+        route_planner::CustomCloseMode::OutAndBack => {
+            let plane: Vec<(f64, f64)> = bd_points
+                .iter()
+                .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+                .collect();
+            let samples = 18usize;
+            let mut dense = Vec::new();
+            for w in plane.windows(2) {
+                for j in 0..samples {
+                    let t = j as f64 / samples as f64;
+                    dense.push((
+                        w[0].0 + (w[1].0 - w[0].0) * t,
+                        w[0].1 + (w[1].1 - w[0].1) * t,
+                    ));
+                }
             }
-        }
-        for w in plane.windows(2).rev() {
-            for j in 0..samples {
-                let t = j as f64 / samples as f64;
-                dense.push((
-                    w[1].0 + (w[0].0 - w[1].0) * t,
-                    w[1].1 + (w[0].1 - w[1].1) * t,
-                ));
+            for w in plane.windows(2).rev() {
+                for j in 0..samples {
+                    let t = j as f64 / samples as f64;
+                    dense.push((
+                        w[1].0 + (w[0].0 - w[1].0) * t,
+                        w[1].1 + (w[0].1 - w[1].1) * t,
+                    ));
+                }
             }
+            let mut arcs = vec![0.0f64];
+            for i in 1..=dense.len() {
+                let a = dense[i - 1];
+                let b = dense[i % dense.len()];
+                arcs.push(arcs[i - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt());
+            }
+            (dense, arcs, (cx, cy))
         }
-        let mut arcs = vec![0.0f64];
-        for i in 1..=dense.len() {
-            let a = dense[i - 1];
-            let b = dense[i % dense.len()];
-            arcs.push(arcs[i - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt());
+        route_planner::CustomCloseMode::Loop | route_planner::CustomCloseMode::AutoPadLoop => {
+            build_catmull_ring(bd_points, cx, cy)
         }
-        return (dense, arcs, (cx, cy));
     }
-    build_catmull_ring(bd_points, cx, cy)
+}
+
+/// 开环 Catmull-Rom 样条：从 `ordered[0]` 依次平滑穿过各点到达 `ordered[n-1]`，首尾不闭合。
+fn build_open_catmull(ordered: &[(f64, f64)], cx: f64, cy: f64) -> PointRing {
+    let n = ordered.len();
+    let plane: Vec<(f64, f64)> = ordered
+        .iter()
+        .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+        .collect();
+    let samples = 18usize;
+    let mut dense = Vec::with_capacity((n - 1) * samples + 1);
+    for i in 0..(n - 1) {
+        let p0 = if i == 0 { plane[0] } else { plane[i - 1] };
+        let p1 = plane[i];
+        let p2 = plane[i + 1];
+        let p3 = if i + 2 < n {
+            plane[i + 2]
+        } else {
+            plane[n - 1]
+        };
+        for j in 0..samples {
+            let t = j as f64 / samples as f64;
+            let (t2, t3) = (t * t, t * t * t);
+            let x = 0.5
+                * ((2.0 * p1.0)
+                    + (-p0.0 + p2.0) * t
+                    + (2.0 * p0.0 - 5.0 * p1.0 + 4.0 * p2.0 - p3.0) * t2
+                    + (-p0.0 + 3.0 * p1.0 - 3.0 * p2.0 + p3.0) * t3);
+            let y = 0.5
+                * ((2.0 * p1.1)
+                    + (-p0.1 + p2.1) * t
+                    + (2.0 * p0.1 - 5.0 * p1.1 + 4.0 * p2.1 - p3.1) * t2
+                    + (-p0.1 + 3.0 * p1.1 - 3.0 * p2.1 + p3.1) * t3);
+            dense.push((x, y));
+        }
+    }
+    dense.push(plane[n - 1]);
+    let mut arcs = Vec::with_capacity(dense.len());
+    arcs.push(0.0);
+    for i in 1..dense.len() {
+        let a = dense[i - 1];
+        let b = dense[i];
+        arcs.push(arcs[i - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt());
+    }
+    (dense, arcs, (cx, cy))
 }
 
 fn build_catmull_ring(ordered: &[(f64, f64)], cx: f64, cy: f64) -> PointRing {
@@ -182,6 +246,38 @@ pub fn ring_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
     let seg = arcs[i] - arcs[i - 1];
     let t = if seg > 0.0 {
         (s - arcs[i - 1]) / seg
+    } else {
+        0.0
+    };
+    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+}
+
+/// 开环路径弧长 → 坐标（线性插值，钳制在 `[0, total]` 内，绝不从终点跳回起点）。
+pub fn open_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
+    if dense.is_empty() {
+        return (0.0, 0.0);
+    }
+    if dense.len() == 1 || arcs.len() < 2 {
+        return dense[0];
+    }
+    let total = *arcs.last().unwrap_or(&1.0);
+    let s = s.clamp(0.0, total);
+    let mut lo = 0usize;
+    let mut hi = arcs.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if arcs[mid] < s {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let i = lo.clamp(1, dense.len() - 1);
+    let a = dense[i - 1];
+    let b = dense[i];
+    let seg = arcs[i] - arcs[i - 1];
+    let t = if seg > 0.0 {
+        ((s - arcs[i - 1]) / seg).clamp(0.0, 1.0)
     } else {
         0.0
     };

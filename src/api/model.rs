@@ -102,7 +102,7 @@ fn default_route_mode() -> String {
 }
 
 fn default_custom_close_mode() -> String {
-    "loop".into()
+    "open".into()
 }
 
 fn default_true() -> bool {

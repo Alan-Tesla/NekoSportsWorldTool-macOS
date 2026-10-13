@@ -314,14 +314,13 @@ pub fn run_full_flow(
                             }
                             Err(e) => {
                                 log(&format!("⚠ [track] 自定义道路路由失败，回退自定义曲线: {e}"));
-                                crate::track::generator::build_ordered(
+                                crate::track::generator::build_ordered_mode(
                                     params.dist,
                                     params.dur,
                                     params.seed,
                                     start_ms,
                                     &custom_wps,
-                                    close_mode
-                                        != crate::track::generate_road::CustomCloseMode::OutAndBack,
+                                    close_mode,
                                     &route_pts,
                                 )
                             }
@@ -329,25 +328,25 @@ pub fn run_full_flow(
                     }
                     Err(e) => {
                         log(&format!("⚠ [track] 路网加载失败，使用自定义曲线生成: {e}"));
-                        crate::track::generator::build_ordered(
+                        crate::track::generator::build_ordered_mode(
                             params.dist,
                             params.dur,
                             params.seed,
                             start_ms,
                             &custom_wps,
-                            close_mode != crate::track::generate_road::CustomCloseMode::OutAndBack,
+                            close_mode,
                             &route_pts,
                         )
                     }
                 }
             } else {
-                crate::track::generator::build_ordered(
+                crate::track::generator::build_ordered_mode(
                     params.dist,
                     params.dur,
                     params.seed,
                     start_ms,
                     &custom_wps,
-                    close_mode != crate::track::generate_road::CustomCloseMode::OutAndBack,
+                    close_mode,
                     &route_pts,
                 )
             }

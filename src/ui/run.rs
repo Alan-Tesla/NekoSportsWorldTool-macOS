@@ -7,7 +7,8 @@
 use super::map::{collect_scene_bounds, MapState, TileSource};
 use super::{mobile, theme, App};
 use crate::track::generate_road::{
-    make_playground_oval, plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RouteMode,
+    append_playground_laps, plan_custom_view, repeat_last_loop, snap_point_to_aligned_road,
+    CustomCloseMode, RouteMode,
 };
 use chrono::{Datelike, Duration, Local, TimeZone, Timelike};
 use eframe::egui;
@@ -547,6 +548,7 @@ impl App {
             let mut need_sync = false;
             let mut chain_cp = false;
             let mut gen_playground = false;
+            let mut repeat_loop = false;
             let mut open_big_map = false;
 
             ui.add_space(4.0);
@@ -564,10 +566,11 @@ impl App {
                     ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
                 }
                 egui::ComboBox::from_id_salt("run_custom_close_mode")
-                    .width(160.0)
+                    .width(180.0)
                     .selected_text(close_mode.label())
                     .show_ui(ui, |ui| {
                         for m in [
+                            CustomCloseMode::Open,
                             CustomCloseMode::Loop,
                             CustomCloseMode::OutAndBack,
                             CustomCloseMode::AutoPadLoop,
@@ -575,12 +578,33 @@ impl App {
                             ui.selectable_value(&mut close_mode, m, m.label());
                         }
                     });
+                mobile::drag_i64(
+                    ui,
+                    "run_playground_laps",
+                    &mut self.osm_page.playground_laps,
+                    1..=15,
+                    0.2,
+                    "",
+                    " 圈",
+                );
                 if ui
-                    .small_button("生成操场跑圈")
-                    .on_hover_text("在操场中心点 1 个点（或沿长轴点 2 个点）后点击，一键生成 400m 跑道")
+                    .small_button("＋插入操场跑圈")
+                    .on_hover_text(
+                        "保留前面路线！在操场中心点一下后点击，自动在当前位置接上 N 圈 400m 跑道，之后可继续点选下一个点位",
+                    )
                     .clicked()
                 {
                     gen_playground = true;
+                }
+                if ui
+                    .add_enabled(
+                        self.config.custom_waypoints.len() >= 3,
+                        egui::Button::new("＋再绕一圈").small(),
+                    )
+                    .on_hover_text("将手动绕出的最近一圈再原地追加一圈")
+                    .clicked()
+                {
+                    repeat_loop = true;
                 }
                 if ui
                     .small_button("串联打卡点")
@@ -644,11 +668,16 @@ impl App {
                 } else {
                     (self.identity.anchor_lat, self.identity.anchor_lon)
                 };
-                self.config.custom_waypoints =
-                    make_playground_oval(&self.config.custom_waypoints, fallback);
+                append_playground_laps(
+                    &mut self.config.custom_waypoints,
+                    fallback,
+                    self.osm_page.playground_laps.clamp(1, 15) as usize,
+                );
                 self.config.custom_snap_road = false;
                 self.osm_page.snap_road = false;
-                self.config.custom_close_mode = CustomCloseMode::Loop.as_str().into();
+                need_sync = true;
+            }
+            if repeat_loop && repeat_last_loop(&mut self.config.custom_waypoints) {
                 need_sync = true;
             }
             if chain_cp {
@@ -855,35 +884,46 @@ impl App {
                 }
             }
 
+            let close_mode_now = CustomCloseMode::from_str(&self.config.custom_close_mode);
             let label = if let Some(err) = &p.route_error {
                 err.clone()
             } else if p.length_m > 0.0 {
-                let loops = plan.dist * 1000.0 / p.length_m;
-                if loops > 1.15 {
+                if is_custom && close_mode_now == CustomCloseMode::Open {
                     format!(
-                        "本次方案 {:.2} km · 单圈 {:.0} m × {:.1} 圈 · {} 打卡点{}",
+                        "本次方案 {:.2} km · 开环总长 {:.0} m · {} 途经点 · {} 打卡点",
                         plan.dist,
                         p.length_m,
-                        loops,
+                        self.config.custom_waypoints.len(),
                         p.checkpoints.len(),
-                        if is_custom {
-                            format!(" · {} 途经点", self.config.custom_waypoints.len())
-                        } else {
-                            String::new()
-                        }
                     )
                 } else {
-                    format!(
-                        "本次方案 {:.2} km · 路线 {:.0} m · {} 打卡点{}",
-                        plan.dist,
-                        p.length_m,
-                        p.checkpoints.len(),
-                        if is_custom {
-                            format!(" · {} 途经点", self.config.custom_waypoints.len())
-                        } else {
-                            String::new()
-                        }
-                    )
+                    let loops = plan.dist * 1000.0 / p.length_m;
+                    if loops > 1.15 {
+                        format!(
+                            "本次方案 {:.2} km · 单圈 {:.0} m × {:.1} 圈 · {} 打卡点{}",
+                            plan.dist,
+                            p.length_m,
+                            loops,
+                            p.checkpoints.len(),
+                            if is_custom {
+                                format!(" · {} 途经点", self.config.custom_waypoints.len())
+                            } else {
+                                String::new()
+                            }
+                        )
+                    } else {
+                        format!(
+                            "本次方案 {:.2} km · 路线 {:.0} m · {} 打卡点{}",
+                            plan.dist,
+                            p.length_m,
+                            p.checkpoints.len(),
+                            if is_custom {
+                                format!(" · {} 途经点", self.config.custom_waypoints.len())
+                            } else {
+                                String::new()
+                            }
+                        )
+                    }
                 }
             } else {
                 format!(

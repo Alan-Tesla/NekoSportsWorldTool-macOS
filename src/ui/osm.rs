@@ -11,8 +11,8 @@ use route_planner::RoadGraph;
 use super::map::{collect_scene_bounds, MapState, TileSource};
 use super::{mobile, theme, App};
 use crate::track::generate_road::{
-    make_playground_oval, plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RoadPlan,
-    RouteMode,
+    append_playground_laps, plan_custom_view, repeat_last_loop, snap_point_to_aligned_road,
+    CustomCloseMode, RoadPlan, RouteMode,
 };
 
 pub struct OsmPage {
@@ -24,6 +24,7 @@ pub struct OsmPage {
     pub snap_road: bool,
     pub show_road_overlay: bool,
     pub show_labels: bool,
+    pub playground_laps: i64,
     pub preview: Option<RoadPlan>,
     pub preview_stale: bool,
 }
@@ -36,9 +37,10 @@ impl Default for OsmPage {
             status: String::new(),
             map: MapState::default(),
             fitted: false,
-            snap_road: true,
+            snap_road: false,
             show_road_overlay: true,
             show_labels: true,
+            playground_laps: 2,
             preview: None,
             preview_stale: true,
         }
@@ -115,12 +117,14 @@ impl App {
         let mut apply_to_run = false;
         let mut chain_checkpoints = false;
         let mut gen_playground = false;
+        let mut repeat_loop = false;
+        let mut sync_dist_m: Option<f64> = None;
 
         ui.add_space(2.0);
         mobile::row(ui, |ui| {
             ui.label("底图：");
             egui::ComboBox::from_id_salt("osm_tile_source")
-                .width(150.0)
+                .width(145.0)
                 .selected_text(tile_source.label())
                 .show_ui(ui, |ui| {
                     for s in [
@@ -134,14 +138,14 @@ impl App {
             ui.checkbox(&mut self.osm_page.show_road_overlay, "路网图层");
             ui.checkbox(&mut self.osm_page.show_labels, "名称标注");
             ui.separator();
-            ui.label("寻路方式：");
+            ui.label("寻路：");
             ui.selectable_value(
                 &mut self.config.custom_snap_road,
                 false,
-                "自由手绘/操场跑圈",
+                "自由手绘/操场",
             )
             .on_hover_text("不强制吸附外部道路，可在操场或任意位置自由点选路径点");
-            ui.selectable_value(&mut self.config.custom_snap_road, true, "沿道路自动寻路")
+            ui.selectable_value(&mut self.config.custom_snap_road, true, "沿道路寻路")
                 .on_hover_text("将途经点吸附到 OSM 道路并自动计算最短道路连线");
             if self.config.custom_snap_road {
                 ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
@@ -149,12 +153,13 @@ impl App {
         });
 
         mobile::row(ui, |ui| {
-            ui.label("闭合：");
+            ui.label("模式：");
             egui::ComboBox::from_id_salt("osm_custom_close_mode")
-                .width(165.0)
+                .width(185.0)
                 .selected_text(close_mode.label())
                 .show_ui(ui, |ui| {
                     for m in [
+                        CustomCloseMode::Open,
                         CustomCloseMode::Loop,
                         CustomCloseMode::OutAndBack,
                         CustomCloseMode::AutoPadLoop,
@@ -162,14 +167,34 @@ impl App {
                         ui.selectable_value(&mut close_mode, m, m.label());
                     }
                 });
+            ui.separator();
+            mobile::drag_i64(
+                ui,
+                "osm_playground_laps",
+                &mut self.osm_page.playground_laps,
+                1..=15,
+                0.2,
+                "",
+                " 圈",
+            );
             if ui
-                .button("生成操场跑圈")
+                .button("＋在末点插入操场跑圈")
                 .on_hover_text(
-                    "在操场中心点 1 个点（或沿操场直道点 2 个点定方向）后点击，一键生成标准 400m 椭圆跑道",
+                    "保留已有路线！用法：先点起点 → 在操场中心点一下并点此按钮（自动接上 N 圈 400m 跑道）→ 继续点出操场后的下一个点位",
                 )
                 .clicked()
             {
                 gen_playground = true;
+            }
+            if ui
+                .add_enabled(
+                    self.config.custom_waypoints.len() >= 3,
+                    egui::Button::new("＋手绘再绕一圈"),
+                )
+                .on_hover_text("若你刚在操场上手动点了一圈点位，点击即可原地再复制绕一圈，之后可继续点选出操场后的终点")
+                .clicked()
+            {
+                repeat_loop = true;
             }
             if ui
                 .button("串联打卡点")
@@ -181,7 +206,7 @@ impl App {
             if ui
                 .add_enabled(
                     !self.config.custom_waypoints.is_empty(),
-                    egui::Button::new("撤销上一点"),
+                    egui::Button::new("撤销"),
                 )
                 .clicked()
             {
@@ -191,7 +216,7 @@ impl App {
             if ui
                 .add_enabled(
                     self.config.custom_waypoints.len() >= 2,
-                    egui::Button::new("反转方向"),
+                    egui::Button::new("反转"),
                 )
                 .clicked()
             {
@@ -209,7 +234,7 @@ impl App {
                 need_sync = true;
             }
             ui.separator();
-            if ui.button("居中适配").clicked() {
+            if ui.button("居中").clicked() {
                 fit_requested = true;
             }
             if ui.small_button("＋").on_hover_text("放大地图").clicked() {
@@ -250,12 +275,16 @@ impl App {
             } else {
                 (self.identity.anchor_lat, self.identity.anchor_lon)
             };
-            self.config.custom_waypoints =
-                make_playground_oval(&self.config.custom_waypoints, fallback);
+            append_playground_laps(
+                &mut self.config.custom_waypoints,
+                fallback,
+                self.osm_page.playground_laps.clamp(1, 15) as usize,
+            );
             self.config.custom_snap_road = false;
             self.osm_page.snap_road = false;
-            self.config.custom_close_mode = CustomCloseMode::Loop.as_str().into();
-            close_mode = CustomCloseMode::Loop;
+            need_sync = true;
+        }
+        if repeat_loop && repeat_last_loop(&mut self.config.custom_waypoints) {
             need_sync = true;
         }
         if chain_checkpoints {
@@ -325,23 +354,55 @@ impl App {
             ));
             if let Some(p) = &self.osm_page.preview {
                 if p.length_m > 0.0 {
-                    let loops = target_dist_m / p.length_m;
                     ui.separator();
-                    ui.colored_label(
-                        theme::ok(),
-                        format!(
-                            "单圈路线 {:.0} m（目标 {:.2} km ≈ {:.1} 圈）",
-                            p.length_m,
-                            target_dist_m / 1000.0,
-                            loops
-                        ),
-                    );
+                    if close_mode == CustomCloseMode::Open {
+                        ui.colored_label(
+                            theme::ok(),
+                            format!(
+                                "开环路线总长 {:.0} m（{:.2} km，目标跑步 {:.2} km）",
+                                p.length_m,
+                                p.length_m / 1000.0,
+                                target_dist_m / 1000.0,
+                            ),
+                        );
+                    } else {
+                        let loops = target_dist_m / p.length_m;
+                        ui.colored_label(
+                            theme::ok(),
+                            format!(
+                                "单圈路线 {:.0} m（目标 {:.2} km ≈ {:.1} 圈）",
+                                p.length_m,
+                                target_dist_m / 1000.0,
+                                loops
+                            ),
+                        );
+                    }
+                    if p.length_m >= 500.0
+                        && ui
+                            .small_button("设为跑步距离")
+                            .on_hover_text("将跑步页的距离范围同步为当前规划路线的长度")
+                            .clicked()
+                    {
+                        sync_dist_m = Some(p.length_m);
+                    }
                 } else if let Some(err) = &p.route_error {
                     ui.separator();
                     ui.colored_label(theme::warn(), err);
                 }
             }
         });
+        if let Some(len_m) = sync_dist_m {
+            let km = (len_m / 1000.0).clamp(0.5, 19.8) as f32;
+            let lo = (km * 100.0).floor() / 100.0;
+            let hi = ((lo + 0.06).min(20.0) * 100.0).round() / 100.0;
+            self.run_page.dist_min = lo;
+            self.run_page.dist_max = hi;
+            self.run_page.regen_plan();
+            self.config.dist_min = lo;
+            self.config.dist_max = hi;
+            self.sync_custom_route_config();
+            self.status = format!("已将跑步目标距离同步为 {:.2}~{:.2} km", lo, hi);
+        }
 
         super::map::legend(
             ui,
