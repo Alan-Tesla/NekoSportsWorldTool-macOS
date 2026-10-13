@@ -185,42 +185,20 @@ fn build_from_ring(
     let mut dts: Vec<f64> = (0..n - 1).map(|i| times[i + 1] - times[i]).collect();
     dts.push(1.0f64.max(dur_f - times[n - 1]));
 
-    let tl_w = [
-        ((-1i64, 4i64), 54u32),
-        ((-1, 1), 27),
-        ((-1, 12), 13),
-        ((-1, 5), 3),
-        ((-1, 6), 2),
-    ];
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
     for _ in 0..n {
         let u = rng.random();
-        if u < 0.39 {
+        // 全程纯绿有效定位点：type=0（62%）与 type=3（38%），绝不注入 type=1/2（暂停）或 type=-1（断点）
+        if u < 0.38 {
             kinds.push((3, 1));
-        } else if u < 0.93 {
-            kinds.push((0, 1));
-        } else if u < 0.96 {
-            kinds.push(rng.weighted(&tl_w));
         } else {
-            kinds.push((rng.choice(&[1, 1, 1, 1, 2, 2]), 1));
-        }
-    }
-    for i in 1..kinds.len() {
-        let prev_drift = (-1 == kinds[i - 1].0) || kinds[i - 1].0 == 5 || kinds[i - 1].0 == 6;
-        if kinds[i].0 != -1 && prev_drift && rng.random() < 0.08 {
-            kinds[i] = (if rng.random() < 0.75 { 7 } else { 8 }, 1);
-        }
-    }
-    for i in 1..n {
-        if kinds[i].0 == -1 && kinds[i - 1].0 == -1 {
-            kinds[i] = (rng.choice(&[3, 0]), 1);
+            kinds.push((0, 1));
         }
     }
 
-    // 先将非正常移动点（哨兵 i<=1 及异常点 -1）的速度置 0，再直接在正常点上做带界速度拟合，
-    // 确保每个正常点的实际位移速度 d_step / dt 严格落在 4~10 分配速窗口内，不因分摊而被二次放大。
+    // 仅哨兵点 i<=1 不计位移，所有跑步过程中的正常点均连续向前推进
     for i in 0..n {
-        if i <= 1 || kinds[i].0 == -1 {
+        if i <= 1 {
             w[i] = 0.0;
         }
     }
@@ -264,85 +242,33 @@ fn build_from_ring(
                 open_point_at(dense, arcs, ss)
             }
         };
-        let mut d_step = 0.0f64;
-        let px;
-        let py;
-        let x;
-        let y;
-        let rad;
-        let state;
-        if typ != -1 {
-            d_step = disp_of[i];
-            s += direction * d_step;
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
-            jx = 0.72 * jx + rng.gauss(0.0, 0.75);
-            jy = 0.72 * jy + rng.gauss(0.0, 0.75);
-            px = bx + jx;
-            py = by + jy;
-            rad = round_to(
-                if typ == 3 { rng.uniform(1.4, 5.1) } else { rng.uniform(1.4, 2.4) },
-                2,
-            );
-            state = if typ == 0 {
-                rng.weighted(&[(1, 145), (2, 45), (3, 164)])
+        let d_step = disp_of[i];
+        s += direction * d_step;
+        let (bx, by) = pos(s);
+        let x = bx;
+        let y = by;
+        jx = 0.72 * jx + rng.gauss(0.0, 0.75);
+        jy = 0.72 * jy + rng.gauss(0.0, 0.75);
+        let px = bx + jx;
+        let py = by + jy;
+        let rad = round_to(
+            if typ == 3 {
+                rng.uniform(1.4, 4.2)
             } else {
-                rng.weighted(&[(1, 145), (2, 256), (3, 151)])
-            };
+                rng.uniform(1.4, 2.4)
+            },
+            2,
+        );
+        let state = if typ == 0 {
+            rng.weighted(&[(1, 145), (2, 45), (3, 164)])
         } else {
-            match lt {
-                4 => {
-                    if rng.random() >= 0.68 {
-                        d_step = if rng.random() < 0.95 { rng.uniform(2.0, 60.0) } else { rng.uniform(60.0, 250.0) };
-                    }
-                }
-                1 => {
-                    if rng.random() >= 0.83 {
-                        d_step = rng.uniform(0.5, 36.0);
-                    }
-                }
-                12 => {
-                    d_step = if rng.random() < 0.9 { rng.uniform(5.0, 80.0) } else { rng.uniform(80.0, 220.0) };
-                }
-                5 => d_step = rng.uniform(5.0, 60.0),
-                _ => d_step = rng.uniform(100.0, 300.0),
-            }
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
-            if d_step > 0.0 {
-                let ang = rng.uniform(0.0, std::f64::consts::TAU);
-                px = x + d_step * ang.sin();
-                py = y + d_step * ang.cos();
-            } else if let Some(last) = locs.last() {
-                // 零位移：精确复制上一点坐标（BD→平面）
-                py = (last.gLat - c_lat) * MET_PER_DEG_LAT;
-                px = (last.gLng - c_lng) * MET_PER_DEG_LNG;
-            } else {
-                px = x + jx;
-                py = y + jy;
-            }
-            rad = if lt == 4 {
-                round_to(if rng.random() < 0.75 { rng.uniform(30.0, 100.0) } else { rng.uniform(100.0, 550.0) }, 2)
-            } else if lt == 1 {
-                round_to(if rng.random() < 0.75 { rng.uniform(1.6, 12.0) } else { rng.uniform(12.0, 95.0) }, 2)
-            } else if lt == 12 {
-                round_to(rng.uniform(30.0, 125.0), 2)
-            } else if lt == 5 {
-                round_to(rng.uniform(25.0, 300.0), 2)
-            } else {
-                550.0
-            };
-            state = rng.weighted(&[(1, 102), (2, 124), (3, 136)]);
-        }
-        if typ != -1 {
-            dist_acc += d_step; // 异常点漂移不计入累计距离
-        }
+            rng.weighted(&[(1, 145), (2, 256), (3, 151)])
+        };
+        dist_acc += d_step;
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
         alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
         // 生物力学高步频小步幅联动（平均步频约 185 spm，平均步幅约 74 cm，严格满足 v = cad/60 * stride）
-        let v_now = if typ != -1 { speeds[i] } else { base };
+        let v_now = speeds[i];
         let km_done = (t_acc / dur_f) * dist / 1000.0;
         let fat = route_planner::fatigue_from_km(km_done);
         let gait = route_planner::gait(v_now, fat);
@@ -358,26 +284,18 @@ fn build_from_ring(
         let cad = v_now * 60.0 / stride;
         steps_acc += cad / 60.0 * dt;
         let nxt = pos(s + direction * 2.0);
-        let brg = ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
-        // 异常点（-1）：avgSpeed 为累计均值（真人与此一致，不为 0）；
-        // GPS 瞬时速度多为低速，偶发 15-46 km/h 漂移尖峰
-        let (avg_sp, gps_speed) = if typ == -1 {
-            let avg = round_to((dist_acc / t_acc.max(1.0)).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
-            let gps = rng.uniform(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6);
-            (avg, round_to(gps, 4))
+        let brg =
+            ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
+        let avg_sp = round_to((d_step / dt.max(0.1)).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
+        let kmh = avg_sp * 3.6;
+        let sigma = (kmh * 0.06).max(0.05);
+        let gps_speed = if i <= 1 {
+            0.0
         } else {
-            let avg = round_to((d_step / dt).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
-            let kmh = avg * 3.6;
-            let sigma = (kmh * 0.06).max(0.05);
-            let gps = if rng.random() < 0.20 {
-                0.0
-            } else {
-                round_to(
-                    (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
-                    4,
-                )
-            };
-            (avg, gps)
+            round_to(
+                (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
+                4,
+            )
         };
 
         ten_t += dt;

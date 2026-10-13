@@ -48,14 +48,6 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
         e.ptype = 6;
         e.locType = 1;
         e.radius = round_to(rng.uniform(1.5, 3.0), 2);
-        // 后半段散布 type=1/2/8（67-99% 行程区间；type=8 真人低频出现）
-        let from = (locs.len() as f64 * 0.67) as usize;
-        for i in from..locs.len().saturating_sub(2) {
-            if rng.random() < 0.06 {
-                locs[i].ptype = rng.choice(&[1, 1, 2, 8]);
-                locs[i].locType = 1;
-            }
-        }
     }
     // 边界修正①：索引2 首个真实点 avgSpeed 不跨哨兵计算，并保持在有效窗口内
     if locs.len() > 3 {

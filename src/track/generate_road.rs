@@ -1012,39 +1012,20 @@ fn build_track_from_route(
     );
 
     // 点位类型（同经典模式）
-    let tl_w = [
-        ((-1i64, 4i64), 54u32),
-        ((-1, 1), 27),
-        ((-1, 12), 13),
-        ((-1, 5), 3),
-        ((-1, 6), 2),
-    ];
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
     for _ in 0..n {
         let u = rng.random();
-        if u < 0.39 {
+        // 全程纯绿有效定位点：type=0（62%）与 type=3（38%），绝不注入 type=1/2（暂停）或 type=-1（断点）
+        if u < 0.38 {
             kinds.push((3, 1));
-        } else if u < 0.93 {
-            kinds.push((0, 1));
-        } else if u < 0.96 {
-            kinds.push(rng.weighted(&tl_w));
         } else {
-            kinds.push((rng.choice(&[1, 1, 1, 1, 2, 2]), 1));
+            kinds.push((0, 1));
         }
     }
-    for i in 1..kinds.len() {
-        let prev_drift = (-1 == kinds[i - 1].0) || kinds[i - 1].0 == 5 || kinds[i - 1].0 == 6;
-        if kinds[i].0 != -1 && prev_drift && rng.random() < 0.08 {
-            kinds[i] = (if rng.random() < 0.75 { 7 } else { 8 }, 1);
-        }
-    }
-    for i in 1..n {
-        if kinds[i].0 == -1 && kinds[i - 1].0 == -1 {
-            kinds[i] = (rng.choice(&[3, 0]), 1);
-        }
-    }
+
+    // 仅哨兵点 i<=1 不计位移，所有跑步过程中的正常点均连续向前推进
     for i in 0..n {
-        if i <= 1 || kinds[i].0 == -1 {
+        if i <= 1 {
             w[i] = 0.0;
         }
     }
@@ -1111,114 +1092,36 @@ fn build_track_from_route(
                 open_point_at(&dense, &arcs, ss)
             }
         };
-        let mut d_step = 0.0f64;
-        let px;
-        let py;
-        let x;
-        let y;
-        let rad;
-        let state;
-        if typ != -1 {
-            d_step = disp_of[i];
-            s += d_step;
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
-            // AR(1) 相关漂移 + 高斯测量噪声，SDF 自适应放大
-            let sc = sdf.sigma_scale([bx, by]);
-            let z = [
-                rng.gauss(0.0, 1.0),
-                rng.gauss(0.0, 1.0),
-                rng.gauss(0.0, 1.0),
-                rng.gauss(0.0, 1.0),
-            ];
-            let (jxd, jyd) = jitter.step(sc, z);
-            px = bx + jxd;
-            py = by + jyd;
-            rad = round_to(
-                if typ == 3 {
-                    rng.uniform(1.4, 5.1)
-                } else {
-                    rng.uniform(1.4, 2.4)
-                },
-                2,
-            );
-            state = if typ == 0 {
-                rng.weighted(&[(1, 145), (2, 45), (3, 164)])
+        let d_step = disp_of[i];
+        s += d_step;
+        let (bx, by) = pos(s);
+        let x = bx;
+        let y = by;
+        // AR(1) 相关漂移 + 高斯测量噪声，SDF 自适应放大
+        let sc = sdf.sigma_scale([bx, by]);
+        let z = [
+            rng.gauss(0.0, 1.0),
+            rng.gauss(0.0, 1.0),
+            rng.gauss(0.0, 1.0),
+            rng.gauss(0.0, 1.0),
+        ];
+        let (jxd, jyd) = jitter.step(sc, z);
+        let px = bx + jxd;
+        let py = by + jyd;
+        let rad = round_to(
+            if typ == 3 {
+                rng.uniform(1.4, 4.2)
             } else {
-                rng.weighted(&[(1, 145), (2, 256), (3, 151)])
-            };
+                rng.uniform(1.4, 2.4)
+            },
+            2,
+        );
+        let state = if typ == 0 {
+            rng.weighted(&[(1, 145), (2, 45), (3, 164)])
         } else {
-            match lt {
-                4 => {
-                    if rng.random() >= 0.68 {
-                        d_step = if rng.random() < 0.95 {
-                            rng.uniform(2.0, 60.0)
-                        } else {
-                            rng.uniform(60.0, 250.0)
-                        };
-                    }
-                }
-                1 => {
-                    if rng.random() >= 0.83 {
-                        d_step = rng.uniform(0.5, 36.0);
-                    }
-                }
-                12 => {
-                    d_step = if rng.random() < 0.9 {
-                        rng.uniform(5.0, 80.0)
-                    } else {
-                        rng.uniform(80.0, 220.0)
-                    };
-                }
-                5 => d_step = rng.uniform(5.0, 60.0),
-                _ => d_step = rng.uniform(100.0, 300.0),
-            }
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
-            if d_step > 0.0 {
-                let ang = rng.uniform(0.0, std::f64::consts::TAU);
-                px = x + d_step * ang.sin();
-                py = y + d_step * ang.cos();
-            } else if let Some(last) = locs.last() {
-                py = (last.gLat - c_lat) * MET_PER_DEG_LAT;
-                px = (last.gLng - c_lng) * MET_PER_DEG_LNG;
-            } else {
-                let (jx, jy) = jitter.state();
-                px = x + jx;
-                py = y + jy;
-            }
-            rad = if lt == 4 {
-                round_to(
-                    if rng.random() < 0.75 {
-                        rng.uniform(30.0, 100.0)
-                    } else {
-                        rng.uniform(100.0, 550.0)
-                    },
-                    2,
-                )
-            } else if lt == 1 {
-                round_to(
-                    if rng.random() < 0.75 {
-                        rng.uniform(1.6, 12.0)
-                    } else {
-                        rng.uniform(12.0, 95.0)
-                    },
-                    2,
-                )
-            } else if lt == 12 {
-                round_to(rng.uniform(30.0, 125.0), 2)
-            } else if lt == 5 {
-                round_to(rng.uniform(25.0, 300.0), 2)
-            } else {
-                550.0
-            };
-            state = rng.weighted(&[(1, 102), (2, 124), (3, 136)]);
-        }
-        if typ != -1 {
-            dist_acc += d_step;
-        }
+            rng.weighted(&[(1, 145), (2, 256), (3, 151)])
+        };
+        dist_acc += d_step;
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
         alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
         // 生物力学联动：v=(cad/60)·stride，平均步幅约 74cm，平均步频约 185spm
@@ -1229,23 +1132,16 @@ fn build_track_from_route(
         let nxt = pos(s + 2.0);
         let brg =
             ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
-        let (avg_sp, gps_speed) = if typ == -1 {
-            let avg = round_to((dist_acc / t_acc.max(1.0)).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
-            let gps = rng.uniform(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6);
-            (avg, round_to(gps, 4))
+        let avg_sp = round_to((d_step / dt.max(0.1)).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
+        let kmh = avg_sp * 3.6;
+        let sigma = (kmh * 0.06).max(0.05);
+        let gps_speed = if i <= 1 {
+            0.0
         } else {
-            let avg = round_to((d_step / dt).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
-            let kmh = avg * 3.6;
-            let sigma = (kmh * 0.06).max(0.05);
-            let gps = if rng.random() < 0.20 {
-                0.0
-            } else {
-                round_to(
-                    (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
-                    4,
-                )
-            };
-            (avg, gps)
+            round_to(
+                (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
+                4,
+            )
         };
 
         ten_t += dt;
