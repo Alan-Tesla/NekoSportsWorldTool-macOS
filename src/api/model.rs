@@ -77,13 +77,30 @@ pub struct Config {
     /// OSM 路网文件路径（真实道路路由用）。
     #[serde(default)]
     pub osm_path: String,
-    /// 路线算法：legacy | road。
+    /// 路线算法：legacy | road | custom。
     #[serde(default = "default_route_mode")]
     pub route_mode: String,
+    /// 用户在地图上自定义规划的途经点列表（BD-09，(lat, lon)）。
+    #[serde(default)]
+    pub custom_waypoints: Vec<(f64, f64)>,
+    /// 自定义路径闭合方式：loop | out_and_back | auto_pad。
+    #[serde(default = "default_custom_close_mode")]
+    pub custom_close_mode: String,
+    /// 自定义路径是否受电子围栏裁剪。
+    #[serde(default = "default_true")]
+    pub custom_clip_fence: bool,
 }
 
 fn default_route_mode() -> String {
     "legacy".into()
+}
+
+fn default_custom_close_mode() -> String {
+    "loop".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_f32() -> f32 {
@@ -123,6 +140,9 @@ impl Default for Config {
             update_check: default_update_check(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
+            custom_waypoints: Vec::new(),
+            custom_close_mode: default_custom_close_mode(),
+            custom_clip_fence: true,
         }
     }
 }

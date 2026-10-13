@@ -46,7 +46,8 @@ fn corner_fillet(
     let cross = dir_in[0] * dir_out[1] - dir_in[1] * dir_out[0];
     let dot = dir_in[0] * dir_out[0] + dir_in[1] * dir_out[1];
     let delta = cross.atan2(dot);
-    if delta.abs() < threshold_rad {
+    // 转角过缓或接近 180° 原地折返时不切外扩圆弧，避免折返处圆弧甩出道路
+    if delta.abs() < threshold_rad || delta.abs() > 165.0_f64.to_radians() {
         return None;
     }
     let d = (radius * (delta.abs() / 2.0).tan())

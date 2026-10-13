@@ -81,9 +81,13 @@ impl App {
     }
 
     /// 后台拉取电子围栏并落盘（供预览裁剪/居中复用），完成后触发预览刷新。
-    /// 仅在真实道路路由模式下才需要围栏，避免经典模式用户也进入该端点请求指纹。
+    /// 仅在真实道路或自定义路径模式下才拉取围栏，避免经典模式用户进入该端点请求指纹。
     pub(crate) fn refresh_fence(&self) {
-        if self.run_page.route_mode != RouteMode::Road {
+        if !matches!(
+            self.run_page.route_mode,
+            RouteMode::Road | RouteMode::Custom
+        ) && self.tab != 7
+        {
             return;
         }
         let Some(session) = self.session.clone() else {
@@ -105,9 +109,13 @@ impl App {
     }
 
     /// 后台拉取实时点位并落盘（供路线预览使用），完成后触发预览刷新。
-    /// 复用 fetch_points 的 TTL 缓存，仅在 Road 模式且锚点已配置时拉取。
+    /// 复用 fetch_points 的 TTL 缓存，仅在 Road/Custom 模式或地图页且锚点已配置时拉取。
     pub(crate) fn refresh_points(&self) {
-        if self.run_page.route_mode != RouteMode::Road {
+        if !matches!(
+            self.run_page.route_mode,
+            RouteMode::Road | RouteMode::Custom
+        ) && self.tab != 7
+        {
             return;
         }
         let Some(session) = self.session.clone() else {

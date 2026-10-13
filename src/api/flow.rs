@@ -251,6 +251,102 @@ pub fn run_full_flow(
             start_ms,
             &pts_bd,
         ),
+        RouteMode::Custom => {
+            let cfg = crate::api::model::load_config();
+            let close_mode =
+                crate::track::generate_road::CustomCloseMode::from_str(&cfg.custom_close_mode);
+            let custom_wps: Vec<(f64, f64)> = if !cfg.custom_waypoints.is_empty() {
+                cfg.custom_waypoints.clone()
+            } else {
+                log("⚠ [track] 自定义规划路径尚未添加途经点，回退使用打卡点序列");
+                route_pts.clone()
+            };
+            log(&format!(
+                "[track] 自定义路径规划：{} 个途经点，模式={}",
+                custom_wps.len(),
+                close_mode.label()
+            ));
+            if !cfg.osm_path.is_empty() {
+                match crate::track::generate_road::load_network_path(&cfg.osm_path) {
+                    Ok(mut net) => {
+                        crate::track::generate_road::align_network(&mut net);
+                        let fences = if cfg.custom_clip_fence {
+                            match crate::api::fence::fetch_geo_fence(client) {
+                                Ok(f) => {
+                                    let _ = crate::api::model::save_fence_cache(&f);
+                                    log(&format!("√ [track] 电子围栏 {} 个", f.len()));
+                                    f
+                                }
+                                Err(e) => {
+                                    log(&format!("⚠ [track] 围栏获取失败，回退缓存: {e}"));
+                                    crate::api::model::load_fence_cache().unwrap_or_default()
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let filtered = if cfg.custom_clip_fence {
+                            crate::track::generate_road::apply_fences(&net, &fences)
+                        } else {
+                            net
+                        };
+                        match crate::track::generate_road::build_custom_road(
+                            params.dist,
+                            params.dur,
+                            params.seed,
+                            start_ms,
+                            &custom_wps,
+                            close_mode,
+                            &route_pts,
+                            &filtered,
+                        ) {
+                            Ok(t) => {
+                                log(&format!(
+                                    "√ [track] 自定义道路轨迹生成完成：{} 点",
+                                    t.locations.len()
+                                ));
+                                t
+                            }
+                            Err(e) => {
+                                log(&format!("⚠ [track] 自定义道路路由失败，回退自定义曲线: {e}"));
+                                crate::track::generator::build_ordered(
+                                    params.dist,
+                                    params.dur,
+                                    params.seed,
+                                    start_ms,
+                                    &custom_wps,
+                                    close_mode
+                                        != crate::track::generate_road::CustomCloseMode::OutAndBack,
+                                    &route_pts,
+                                )
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log(&format!("⚠ [track] 路网加载失败，使用自定义曲线生成: {e}"));
+                        crate::track::generator::build_ordered(
+                            params.dist,
+                            params.dur,
+                            params.seed,
+                            start_ms,
+                            &custom_wps,
+                            close_mode != crate::track::generate_road::CustomCloseMode::OutAndBack,
+                            &route_pts,
+                        )
+                    }
+                }
+            } else {
+                crate::track::generator::build_ordered(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    start_ms,
+                    &custom_wps,
+                    close_mode != crate::track::generate_road::CustomCloseMode::OutAndBack,
+                    &route_pts,
+                )
+            }
+        }
     };
     if let Some(range) = params.manual_altitude_range {
         crate::track::altitude::override_bd_a_range(&mut track, range)?;

@@ -90,6 +90,9 @@ impl App {
                     let nodes = net.graph.node_count();
                     let bld = net.buildings.len();
                     self.osm_page.fitted = false;
+                    self.osm_page.preview_stale = true;
+                    self.run_page.preview_stale = true;
+                    self.run_page.map_fitted = false;
                     self.osm_page.status = format!("√ 路网加载成功：{nodes} 节点 / {bld} 建筑");
                     self.log
                         .push(&format!("[osm] 路网加载成功：{nodes} 节点 / {bld} 建筑"));
@@ -106,9 +109,11 @@ impl App {
         }
         if done_fence {
             self.run_page.preview_stale = true;
+            self.osm_page.preview_stale = true;
         }
         if done_points {
             self.run_page.preview_stale = true;
+            self.osm_page.preview_stale = true;
         }
         if let Some(v) = done_login {
             self.login_busy = false;

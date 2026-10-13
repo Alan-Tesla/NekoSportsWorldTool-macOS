@@ -10,31 +10,43 @@
 
 use super::generator::{SPEED_CEIL, SPEED_FLOOR};
 use super::geom::{
-    fmt_gain_time, ring_point_at, round_to, to_bd, wgs84_to_bd09, Rng, MET_PER_DEG_LAT,
-    MET_PER_DEG_LNG,
+    fmt_gain_time, make_ordered_ring, ring_point_at, round_to, to_bd, wgs84_to_bd09, Rng,
+    MET_PER_DEG_LAT, MET_PER_DEG_LNG,
 };
 use super::model::{GenPoint, Segment, TenWindow, Track};
 use super::postfix::apply_post_fixes;
+pub use route_planner::CustomCloseMode;
 use route_planner::{
-    fatigue_from_km, gait, ou_cadence_series, pace_profile, plan_route_split, point_in_polygon,
-    Coord, GpsJitter, KinParams, RoadGraph, Route, RouteOptions, Sdf,
+    fatigue_from_km, gait, ou_cadence_series, pace_profile, plan_custom_route, plan_route_split,
+    point_in_polygon, Coord, GpsJitter, KinParams, RoadGraph, Route, RouteOptions, Sdf,
 };
 
-/// 路线算法模式（二选一）。
+/// 路线算法模式（三选一）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RouteMode {
     /// 经典打卡点环（Catmull-Rom）。
     #[default]
     Legacy,
-    /// 真实道路拓扑路由。
+    /// 真实道路拓扑路由（自动闭环）。
     Road,
+    /// 地图自定义规划路径（按用户放置的途经点路由）。
+    Custom,
 }
 
 impl RouteMode {
     pub fn from_str(s: &str) -> Self {
         match s {
             "road" => RouteMode::Road,
+            "custom" => RouteMode::Custom,
             _ => RouteMode::Legacy,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteMode::Legacy => "legacy",
+            RouteMode::Road => "road",
+            RouteMode::Custom => "custom",
         }
     }
 }
@@ -46,6 +58,7 @@ pub fn load_network_path(path: &str) -> Result<RoadGraph, String> {
 }
 
 /// 路网预览计划（供地图显示）：对齐后的路网/建筑 + 生成的路线（BD 系）。
+#[derive(Clone, Default)]
 pub struct RoadPlan {
     pub route: Vec<(f64, f64)>,
     pub length_m: f64,
@@ -53,6 +66,7 @@ pub struct RoadPlan {
     pub buildings: Vec<Vec<(f64, f64)>>,
     pub checkpoints: Vec<(f64, f64)>,
     pub fences: Vec<Vec<(f64, f64)>>,
+    pub route_error: Option<String>,
 }
 
 /// 用围栏（BD 系，与打卡点同系）裁剪路网：仅保留围栏内道路；裁剪后无路则退回原网。
@@ -126,7 +140,134 @@ pub fn plan_road_view(
         buildings,
         checkpoints: ordered,
         fences: fences.to_vec(),
+        route_error: None,
     })
+}
+
+/// 生成自定义路径规划预览：
+/// - 若已加载 OSM 路网，则对齐到 BD-09（可选围栏裁剪）并沿真实道路按序连接 `waypoints_bd`；
+/// - 若未加载 OSM 路网，则按 `waypoints_bd` 拟合平滑闭合环或折返折线；
+/// - 即使途经点不足或寻路报错，仍返回完整的底图要素（道路/建筑/打卡点/围栏）供交互点击。
+#[allow(clippy::too_many_arguments)]
+pub fn plan_custom_view(
+    net: Option<&RoadGraph>,
+    waypoints_bd: &[(f64, f64)],
+    checkpoints_bd: &[(f64, f64)],
+    fences: &[Vec<(f64, f64)>],
+    clip_fence: bool,
+    close_mode: CustomCloseMode,
+    dist_m: f64,
+    seed: u64,
+) -> RoadPlan {
+    let ordered_cp = radial_order(checkpoints_bd);
+    if let Some(raw_net) = net {
+        let mut g = raw_net.clone();
+        align_network(&mut g);
+        if clip_fence {
+            g = apply_fences(&g, fences);
+        }
+        let edges: Vec<Vec<(f64, f64)>> = g
+            .edges_deg()
+            .iter()
+            .map(|e| e.iter().map(|c| (c.lat, c.lon)).collect())
+            .collect();
+        let buildings: Vec<Vec<(f64, f64)>> = g
+            .buildings
+            .iter()
+            .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
+            .collect();
+        if waypoints_bd.is_empty() {
+            return RoadPlan {
+                route: Vec::new(),
+                length_m: 0.0,
+                edges,
+                buildings,
+                checkpoints: ordered_cp,
+                fences: fences.to_vec(),
+                route_error: Some("左键点击地图添加起点与途经点，拖拽可调整位置，右键删除".into()),
+            };
+        }
+        let wp_coords: Vec<Coord> = waypoints_bd
+            .iter()
+            .map(|&(lat, lon)| Coord::new(lon, lat))
+            .collect();
+        let opts = RouteOptions::default();
+        match plan_custom_route(&g, &wp_coords, close_mode, dist_m, seed, &opts) {
+            Ok(route) => {
+                let route_pts: Vec<(f64, f64)> =
+                    route.points.iter().map(|p| (p.lat, p.lon)).collect();
+                RoadPlan {
+                    route: route_pts,
+                    length_m: route.length_m,
+                    edges,
+                    buildings,
+                    checkpoints: ordered_cp,
+                    fences: fences.to_vec(),
+                    route_error: None,
+                }
+            }
+            Err(e) => RoadPlan {
+                route: waypoints_bd.to_vec(),
+                length_m: 0.0,
+                edges,
+                buildings,
+                checkpoints: ordered_cp,
+                fences: fences.to_vec(),
+                route_error: Some(e),
+            },
+        }
+    } else {
+        if waypoints_bd.len() < 2 {
+            return RoadPlan {
+                route: waypoints_bd.to_vec(),
+                length_m: 0.0,
+                edges: Vec::new(),
+                buildings: Vec::new(),
+                checkpoints: ordered_cp,
+                fences: fences.to_vec(),
+                route_error: Some(
+                    "左键点击地图添加至少 2 个途经点即可规划路线（导入 OSM 后可沿真实道路寻路）"
+                        .into(),
+                ),
+            };
+        }
+        let close_loop = close_mode != CustomCloseMode::OutAndBack;
+        let (dense, arcs, (cx, cy)) = make_ordered_ring(waypoints_bd, close_loop);
+        let mut route_pts: Vec<(f64, f64)> = dense
+            .iter()
+            .map(|&(x, y)| to_bd(x, y, cx, cy))
+            .collect();
+        if let Some(&first) = route_pts.first() {
+            route_pts.push(first);
+        }
+        let length_m = *arcs.last().unwrap_or(&0.0);
+        RoadPlan {
+            route: route_pts,
+            length_m,
+            edges: Vec::new(),
+            buildings: Vec::new(),
+            checkpoints: ordered_cp,
+            fences: fences.to_vec(),
+            route_error: None,
+        }
+    }
+}
+
+/// 将坐标点吸附到对齐后的 BD-09 路网最近道路上（距离阈值内生效）。
+pub fn snap_point_to_aligned_road(
+    net: &RoadGraph,
+    fences: &[Vec<(f64, f64)>],
+    clip_fence: bool,
+    lat: f64,
+    lon: f64,
+) -> Option<((f64, f64), f64)> {
+    let mut g = net.clone();
+    align_network(&mut g);
+    if clip_fence {
+        g = apply_fences(&g, fences);
+    }
+    let (snapped, dist_m) = g.snap_to_road(Coord::new(lon, lat))?;
+    Some(((snapped.lat, snapped.lon), dist_m))
 }
 
 /// 将 WGS84 路网逐节点转换为 BD-09（与打卡点同系）。
@@ -206,7 +347,6 @@ pub fn build_road(
     must_bd: &[(f64, f64)],
     net: &RoadGraph,
 ) -> Result<Track, String> {
-    let mut rng = Rng::new(seed);
     let dur_f = dur as f64;
     let avg_v = dist / dur_f;
     let a_c_max = 2.5;
@@ -220,13 +360,66 @@ pub fn build_road(
     let waypoints: Vec<Coord> = route_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
     let must: Vec<Coord> = must_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
     let route = plan_route_split(net, &waypoints, &must, dist, seed, &opts)?;
+    build_track_from_route(dist, dur, seed, start_ms, &route, route_bd, route_bd, net)
+}
 
-    let n_pts = route_bd.len().max(1);
+/// 模式 C（有 OSM 路网）：按用户自定义途经点在真实路网上规划路线并生成完整协议轨迹。
+#[allow(clippy::too_many_arguments)]
+pub fn build_custom_road(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    waypoints_bd: &[(f64, f64)],
+    close_mode: CustomCloseMode,
+    snap_bd: &[(f64, f64)],
+    net: &RoadGraph,
+) -> Result<Track, String> {
+    let dur_f = dur as f64;
+    let avg_v = dist / dur_f;
+    let a_c_max = 2.5;
+    let radius = (avg_v * avg_v / a_c_max).max(6.0);
+    let opts = RouteOptions {
+        a_c_max,
+        min_radius_m: radius,
+        ..Default::default()
+    };
+    let waypoints: Vec<Coord> = waypoints_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
+    let route = plan_custom_route(net, &waypoints, close_mode, dist, seed, &opts)?;
+    build_track_from_route(
+        dist,
+        dur,
+        seed,
+        start_ms,
+        &route,
+        waypoints_bd,
+        snap_bd,
+        net,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_track_from_route(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    route: &Route,
+    ref_bd: &[(f64, f64)],
+    snap_bd: &[(f64, f64)],
+    net: &RoadGraph,
+) -> Result<Track, String> {
+    let mut rng = Rng::new(seed);
+    let dur_f = dur as f64;
+    let avg_v = dist / dur_f;
+    let a_c_max = 2.5;
+
+    let n_pts = ref_bd.len().max(1);
     let (c_lat, c_lng) = (
-        route_bd.iter().map(|q| q.0).sum::<f64>() / n_pts as f64,
-        route_bd.iter().map(|q| q.1).sum::<f64>() / n_pts as f64,
+        ref_bd.iter().map(|q| q.0).sum::<f64>() / n_pts as f64,
+        ref_bd.iter().map(|q| q.1).sum::<f64>() / n_pts as f64,
     );
-    let (dense, arcs) = route_ring(&route, c_lat, c_lng);
+    let (dense, arcs) = route_ring(route, c_lat, c_lng);
 
     // 时间网格（同经典模式）
     let mut times = Vec::new();
@@ -250,7 +443,7 @@ pub fn build_road(
     };
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let w = pace_profile(
-        &route,
+        route,
         avg_v,
         &dts,
         dist,
@@ -580,7 +773,7 @@ pub fn build_road(
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
     // 点位吸附：<40m 精确落位（全量打卡点，含必经点与普通打卡点）
-    for pl in route_bd {
+    for pl in snap_bd {
         let mut best_i = None;
         let mut best_d = 1e18f64;
         for (i, q) in locs.iter().enumerate() {
@@ -614,4 +807,43 @@ pub fn build_road(
         stepsPerTenSec: ten_steps,
         segments,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_view_and_ordered_track_work_with_and_without_osm() {
+        let wps = vec![
+            (38.889000, 121.531000),
+            (38.890500, 121.531000),
+            (38.890500, 121.533000),
+        ];
+        let view = plan_custom_view(
+            None,
+            &wps,
+            &wps,
+            &[],
+            false,
+            CustomCloseMode::Loop,
+            2000.0,
+            7,
+        );
+        assert!(view.route_error.is_none());
+        assert!(view.length_m > 200.0);
+        assert!(view.route.len() > 10);
+
+        let track = crate::track::generator::build_ordered(
+            1500.0,
+            540,
+            7,
+            1_700_000_000_000,
+            &wps,
+            true,
+            &wps,
+        );
+        assert!((track.totalDistance - 1500.0).abs() < 1.0);
+        assert!(!track.locations.is_empty());
+    }
 }

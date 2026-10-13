@@ -73,6 +73,59 @@ pub fn make_point_ring(bd_points: &[(f64, f64)]) -> PointRing {
         let kb = (b.0 - cx).atan2(b.1 - cy);
         ka.partial_cmp(&kb).unwrap()
     });
+    build_catmull_ring(&ordered, cx, cy)
+}
+
+/// 按用户给定的点序（不重排角度）构建闭合或折返平面路径 + 弧长表 + 中心。
+pub fn make_ordered_ring(bd_points: &[(f64, f64)], close_loop: bool) -> PointRing {
+    let n = bd_points.len();
+    if n == 0 {
+        return ( vec![(0.0, 0.0)], vec![0.0, 1.0], (0.0, 0.0) );
+    }
+    let cx = bd_points.iter().map(|q| q.0).sum::<f64>() / n as f64;
+    let cy = bd_points.iter().map(|q| q.1).sum::<f64>() / n as f64;
+    if n == 1 {
+        return (vec![(0.0, 0.0)], vec![0.0, 1.0], (cx, cy));
+    }
+    if !close_loop {
+        // 原路折返：正向折线分段采样 + 反向折返闭合
+        let plane: Vec<(f64, f64)> = bd_points
+            .iter()
+            .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+            .collect();
+        let samples = 18usize;
+        let mut dense = Vec::new();
+        for w in plane.windows(2) {
+            for j in 0..samples {
+                let t = j as f64 / samples as f64;
+                dense.push((
+                    w[0].0 + (w[1].0 - w[0].0) * t,
+                    w[0].1 + (w[1].1 - w[0].1) * t,
+                ));
+            }
+        }
+        for w in plane.windows(2).rev() {
+            for j in 0..samples {
+                let t = j as f64 / samples as f64;
+                dense.push((
+                    w[1].0 + (w[0].0 - w[1].0) * t,
+                    w[1].1 + (w[0].1 - w[1].1) * t,
+                ));
+            }
+        }
+        let mut arcs = vec![0.0f64];
+        for i in 1..=dense.len() {
+            let a = dense[i - 1];
+            let b = dense[i % dense.len()];
+            arcs.push(arcs[i - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt());
+        }
+        return (dense, arcs, (cx, cy));
+    }
+    build_catmull_ring(bd_points, cx, cy)
+}
+
+fn build_catmull_ring(ordered: &[(f64, f64)], cx: f64, cy: f64) -> PointRing {
+    let n = ordered.len();
     let plane: Vec<(f64, f64)> = ordered
         .iter()
         .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))

@@ -248,3 +248,66 @@ fn test_osm_parse_minimal() {
     assert!(g.graph.edge_count() >= 2, "双向道路边");
     assert_eq!(g.buildings.len(), 1, "应解析出 1 个建筑");
 }
+
+#[test]
+fn test_plan_custom_route_modes_and_snap() {
+    use route_planner::{plan_custom_route, CustomCloseMode};
+
+    let g = grid();
+    // 道路吸附测试
+    let (snapped, dist_m) = g.snap_to_road(Coord::new(0.0005, 0.00005)).unwrap();
+    assert!(dist_m < 10.0, "应吸附到最近道路，dist_m={dist_m}");
+    assert!((snapped.lat - 0.0).abs() < 1e-4);
+
+    let wps = vec![
+        Coord::new(0.0, 0.0),
+        Coord::new(0.002, 0.0),
+        Coord::new(0.002, 0.002),
+    ];
+
+    // 1. Loop 闭合环线模式
+    let r_loop = plan_custom_route(
+        &g,
+        &wps,
+        CustomCloseMode::Loop,
+        1000.0,
+        42,
+        &RouteOptions::default(),
+    )
+    .unwrap();
+    assert!(r_loop.length_m > 400.0);
+    let first = r_loop.points.first().unwrap();
+    let last = r_loop.points.last().unwrap();
+    assert!((first.lat - last.lat).abs() < 1e-4 && (first.lon - last.lon).abs() < 1e-4);
+
+    // 2. OutAndBack 原路折返模式（无外扩圆弧甩出道路）
+    let r_back = plan_custom_route(
+        &g,
+        &wps[..2],
+        CustomCloseMode::OutAndBack,
+        1000.0,
+        42,
+        &RouteOptions::default(),
+    )
+    .unwrap();
+    assert!(r_back.length_m > 300.0);
+    for pt in &r_back.points {
+        assert!(
+            pt.lat.abs() < 1e-4,
+            "折返路线不应偏离 y=0 道路: lat={}",
+            pt.lat
+        );
+    }
+
+    // 3. AutoPadLoop 自动凑距闭环模式（支持仅 1 个起点）
+    let r_pad = plan_custom_route(
+        &g,
+        &wps[..1],
+        CustomCloseMode::AutoPadLoop,
+        1200.0,
+        42,
+        &RouteOptions::default(),
+    )
+    .unwrap();
+    assert!(r_pad.length_m > 600.0);
+}

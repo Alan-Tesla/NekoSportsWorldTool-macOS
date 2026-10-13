@@ -26,7 +26,7 @@ pub use graph::{point_in_polygon, Coord, RoadGraph};
 pub use kinematics::{pace_profile, speed_limit_ahead, KinParams};
 pub use load::{load_osm, parse_osm};
 pub use noise::{ar1_xy, GpsJitter};
-pub use route::RouteOptions;
+pub use route::{CustomCloseMode, RouteOptions};
 pub use sdf::Sdf;
 pub use smooth::{turn_speed_limit, RoutePoint};
 
@@ -89,6 +89,31 @@ pub fn plan_route_split(
         seed,
         opts,
     )?;
+    let coords = route::path_coords(&g, &path);
+    let points =
+        smooth::smooth_and_sample(&g, &coords, opts.min_radius_m, opts.turn_threshold_deg, 1.0);
+    if points.is_empty() {
+        return Err("路线平滑后为空".into());
+    }
+    let length_m = points.last().map(|p| p.s).unwrap_or(0.0);
+    Ok(Route { points, length_m })
+}
+
+/// 自定义路径规划入口：按用户给定的有序途经点序列，在路网中规划路线并做圆弧曲率平滑。
+pub fn plan_custom_route(
+    net: &RoadGraph,
+    waypoints: &[Coord],
+    close_mode: CustomCloseMode,
+    target_len_m: f64,
+    seed: u64,
+    opts: &RouteOptions,
+) -> Result<Route, String> {
+    if waypoints.is_empty() {
+        return Err("请先在地图上点击添加途经点".into());
+    }
+    let mut g = net.clone();
+    let vnodes = project::add_virtual_nodes(&mut g, waypoints)?;
+    let path = route::plan_custom_nodes(&g, &vnodes, close_mode, target_len_m, seed, opts)?;
     let coords = route::path_coords(&g, &path);
     let points =
         smooth::smooth_and_sample(&g, &coords, opts.min_radius_m, opts.turn_threshold_deg, 1.0);

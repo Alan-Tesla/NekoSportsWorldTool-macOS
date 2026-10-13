@@ -46,8 +46,17 @@ impl Default for KinParams {
 /// `sqrt(v_corner² + 2·b·d)`，取所有候选的最小值。
 pub fn speed_limit_ahead(route: &Route, s: f64, p: &KinParams) -> f64 {
     let mut v_max = f64::INFINITY;
+    let total = route.length_m;
+    let s_mod = if total > 1.0 {
+        s.rem_euclid(total)
+    } else {
+        s
+    };
     for pt in &route.points {
-        let d = pt.s - s;
+        let mut d = pt.s - s_mod;
+        if d <= 0.0 && total > 1.0 {
+            d += total;
+        }
         if d <= 0.0 || d > p.lookahead_m {
             continue;
         }

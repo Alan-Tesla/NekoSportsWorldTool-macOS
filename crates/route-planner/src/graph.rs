@@ -182,6 +182,13 @@ impl RoadGraph {
         best
     }
 
+    /// 将度系坐标投影吸附到最近道路线段上，返回 `(道路垂足度系坐标, 距离米)`。
+    pub fn snap_to_road(&self, c: Coord) -> Option<(Coord, f64)> {
+        let p = self.to_m(c);
+        let (_edge, _t, proj, dist_m) = self.nearest_edge(p)?;
+        Some((self.to_deg(proj), dist_m))
+    }
+
     /// 增量插入一条有向边到空间索引（切分边新增子段时调用，避免全量重建）。
     pub fn index_insert_edge(&mut self, from: NodeIndex, to: NodeIndex) {
         let a = self.to_m(self.graph[from].coord);

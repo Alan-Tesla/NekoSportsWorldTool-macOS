@@ -4,9 +4,11 @@
 //! 内抽样，并保证「开始 + 用时」不越过当前时刻；指定模式完全按用户填写的时/分
 //! （尚未到达时按当前时刻），「换一版」只重掷运动量，不动时刻。
 
-use super::map::MapState;
+use super::map::{collect_scene_bounds, MapState};
 use super::{mobile, theme, App};
-use crate::track::generate_road::RouteMode;
+use crate::track::generate_road::{
+    plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RouteMode,
+};
 use chrono::{Datelike, Duration, Local, TimeZone, Timelike};
 use eframe::egui;
 
@@ -390,20 +392,28 @@ impl App {
                 ui.label("人脸校验标记：");
                 ui.checkbox(&mut page.face_check, "faceCheck=1");
             });
-            ui.horizontal(|ui| {
+            mobile::row(ui, |ui| {
                 ui.label("路线算法：");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典打卡点环");
                 ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
+                ui.selectable_value(&mut page.route_mode, RouteMode::Custom, "自定义规划路径");
                 if page.route_mode == RouteMode::Road && self.network.is_none() {
                     ui.colored_label(theme::warn(), "（需先在「路网」页导入 OSM）");
                 }
             });
         }
 
-        // 切换到真实道路路由时按需拉取电子围栏与实时点位（经典模式不触发这些端点）。
-        if self.run_page.route_mode == RouteMode::Road && prev_route != RouteMode::Road {
-            self.refresh_fence();
-            self.refresh_points();
+        // 切换到真实道路或自定义规划路径时按需拉取电子围栏与实时点位，并触发预览刷新。
+        if self.run_page.route_mode != prev_route {
+            self.run_page.preview_stale = true;
+            self.run_page.map_fitted = false;
+            if matches!(
+                self.run_page.route_mode,
+                RouteMode::Road | RouteMode::Custom
+            ) {
+                self.refresh_fence();
+                self.refresh_points();
+            }
         }
 
         ui.add_space(8.0);
@@ -497,34 +507,157 @@ impl App {
     }
 
     fn draw_run_map(&mut self, ui: &mut egui::Ui) {
-        if self.run_page.route_mode != RouteMode::Road {
+        let mode = self.run_page.route_mode;
+        if mode == RouteMode::Legacy {
+            mobile::row(ui, |ui| {
+                if ui.small_button("在地图上规划自定义路径 →").clicked() {
+                    self.run_page.route_mode = RouteMode::Custom;
+                    self.run_page.preview_stale = true;
+                    self.run_page.map_fitted = false;
+                    self.refresh_fence();
+                    self.refresh_points();
+                }
+                if ui.small_button("打开大图规划页").clicked() {
+                    self.tab = 7;
+                }
+            });
             return;
         }
-        let Some(net) = self.network.clone() else {
+
+        if mode == RouteMode::Road && self.network.is_none() {
             ui.colored_label(
                 theme::warn(),
-                "未加载 OSM 路网，无法预览（请先到「路网」页导入）",
+                "未加载 OSM 路网，无法预览真实道路路由（请先到「路网」页导入，或改用「自定义规划路径」）",
             );
             return;
-        };
+        }
         let Some(plan) = self.run_page.plan.clone() else {
             return;
         };
 
+        let is_custom = mode == RouteMode::Custom;
+        let (pts_bd, fences) = self.cached_points_and_fences();
+
+        // 自定义规划路径的内联控制栏
+        if is_custom {
+            let mut close_mode = CustomCloseMode::from_str(&self.config.custom_close_mode);
+            let prev_close = close_mode;
+            let prev_clip = self.config.custom_clip_fence;
+            let mut need_sync = false;
+            let mut chain_cp = false;
+            let mut open_big_map = false;
+
+            ui.add_space(4.0);
+            mobile::row(ui, |ui| {
+                ui.label("规划：");
+                egui::ComboBox::from_id_salt("run_custom_close_mode")
+                    .width(175.0)
+                    .selected_text(close_mode.label())
+                    .show_ui(ui, |ui| {
+                        for m in [
+                            CustomCloseMode::Loop,
+                            CustomCloseMode::OutAndBack,
+                            CustomCloseMode::AutoPadLoop,
+                        ] {
+                            ui.selectable_value(&mut close_mode, m, m.label());
+                        }
+                    });
+                if self.network.is_some() {
+                    ui.checkbox(&mut self.osm_page.snap_road, "道路吸附");
+                    ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
+                }
+                if ui
+                    .small_button("串联打卡点")
+                    .on_hover_text("将打卡点按环序填入途经点")
+                    .clicked()
+                {
+                    chain_cp = true;
+                }
+                if ui
+                    .add_enabled(
+                        !self.config.custom_waypoints.is_empty(),
+                        egui::Button::new("撤销").small(),
+                    )
+                    .clicked()
+                {
+                    self.config.custom_waypoints.pop();
+                    need_sync = true;
+                }
+                if ui
+                    .add_enabled(
+                        self.config.custom_waypoints.len() >= 2,
+                        egui::Button::new("反转").small(),
+                    )
+                    .clicked()
+                {
+                    self.config.custom_waypoints.reverse();
+                    need_sync = true;
+                }
+                if ui
+                    .add_enabled(
+                        !self.config.custom_waypoints.is_empty(),
+                        egui::Button::new("清空").small(),
+                    )
+                    .clicked()
+                {
+                    self.config.custom_waypoints.clear();
+                    need_sync = true;
+                }
+                if ui.small_button("居中").clicked() {
+                    self.run_page.map_fitted = false;
+                }
+                if ui.small_button("打开大图规划 →").clicked() {
+                    open_big_map = true;
+                }
+            });
+
+            if close_mode != prev_close {
+                self.config.custom_close_mode = close_mode.as_str().into();
+                need_sync = true;
+            }
+            if self.config.custom_clip_fence != prev_clip {
+                need_sync = true;
+            }
+            if chain_cp {
+                if !pts_bd.is_empty() {
+                    self.config.custom_waypoints =
+                        crate::track::generate_road::radial_order(&pts_bd);
+                    need_sync = true;
+                    self.run_page.map_fitted = false;
+                } else {
+                    self.status = "暂无打卡点缓存，请直接点击地图添加途经点".into();
+                }
+            }
+            if need_sync {
+                self.sync_custom_route_config();
+            }
+            if open_big_map {
+                self.tab = 7;
+            }
+        }
+
         if self.run_page.preview_stale {
             self.run_page.preview = None;
-            self.run_page.map_fitted = false;
             self.run_page.preview_stale = false;
-            // 点位缓存按锚点隔离（main 的串城市防护）；锚点无效时视为无缓存
-            let cached = self
-                .identity
-                .anchor_coordinate()
-                .ok()
-                .and_then(crate::api::model::load_points_cache_for);
-            if let Some((_ts, pts)) = cached {
-                let pts_bd = crate::api::points::points_bd(&pts);
+            if is_custom {
+                let close_mode = CustomCloseMode::from_str(&self.config.custom_close_mode);
+                let p = plan_custom_view(
+                    self.network.as_deref(),
+                    &self.config.custom_waypoints,
+                    &pts_bd,
+                    &fences,
+                    self.config.custom_clip_fence,
+                    close_mode,
+                    plan.dist * 1000.0,
+                    plan.seed,
+                );
+                if let Some(err) = &p.route_error {
+                    self.status = err.clone();
+                }
+                self.run_page.preview = Some(p);
+            } else if let Some(net) = self.network.clone() {
+                self.run_page.map_fitted = false;
                 if !pts_bd.is_empty() {
-                    let fences = crate::api::model::load_fence_cache().unwrap_or_default();
                     match crate::track::generate_road::plan_road_view(
                         &net,
                         &pts_bd,
@@ -536,56 +669,69 @@ impl App {
                         Err(e) => self.status = format!("路线预览失败：{e}"),
                     }
                 } else {
-                    self.status = "无打卡点缓存，提交后可回显轨迹".into();
+                    self.status = "无打卡点缓存，提交后可回显轨迹（或切换到「自定义规划路径」手绘）".into();
                 }
-            } else {
-                self.status = "无打卡点缓存，提交后可回显轨迹".into();
             }
         }
 
         if self.run_page.preview.is_some() {
-            super::map::legend(
-                ui,
-                &[
-                    ("道路", egui::Color32::from_rgb(200, 208, 204)),
-                    ("建筑", egui::Color32::from_rgb(224, 194, 170)),
-                    ("路线", egui::Color32::from_rgb(30, 111, 216)),
-                    ("打卡点", egui::Color32::from_rgb(240, 180, 0)),
-                    ("起点", egui::Color32::from_rgb(22, 160, 90)),
-                    ("终点", egui::Color32::from_rgb(220, 38, 38)),
-                ],
-            );
+            mobile::row(ui, |ui| {
+                super::map::legend(
+                    ui,
+                    &[
+                        ("道路", egui::Color32::from_rgb(200, 208, 204)),
+                        ("建筑", egui::Color32::from_rgb(224, 194, 170)),
+                        ("围栏", egui::Color32::from_rgb(180, 118, 0)),
+                        ("路线", egui::Color32::from_rgb(30, 111, 216)),
+                        ("打卡点", egui::Color32::from_rgb(240, 180, 0)),
+                        ("起点", egui::Color32::from_rgb(22, 160, 90)),
+                        ("末点", egui::Color32::from_rgb(220, 38, 38)),
+                    ],
+                );
+                if !is_custom && ui.small_button("居中").clicked() {
+                    self.run_page.map_fitted = false;
+                }
+            });
         }
 
         ui.add_space(4.0);
         let rect = ui.available_rect_before_wrap();
-        let (response, painter) = ui.allocate_painter(
-            egui::Vec2::new(rect.width().max(200.0), 240.0),
-            egui::Sense::drag(),
-        );
+        let canvas_h = if is_custom { 280.0 } else { 240.0 };
+        let sense = if is_custom {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::drag()
+        };
+        let (response, painter) =
+            ui.allocate_painter(egui::Vec2::new(rect.width().max(200.0), canvas_h), sense);
         let canvas = response.rect;
         painter.rect_filled(
             canvas,
-            egui::Rounding::ZERO,
+            egui::Rounding::same(4.0),
             egui::Color32::from_rgb(250, 252, 251),
         );
 
-        // 首次预览后适配视野：优先以电子围栏为中点/范围，无围栏时退化为路线+打卡点+道路
+        // 首次预览后适配视野：优先围栏/途经点/路线/打卡点/道路
         if !self.run_page.map_fitted {
-            let mut bounds: Vec<(f64, f64)> = Vec::new();
             if let Some(p) = &self.run_page.preview {
-                for f in &p.fences {
-                    bounds.extend(f.iter().copied());
+                let mut bounds = collect_scene_bounds(
+                    &p.fences,
+                    if is_custom {
+                        &self.config.custom_waypoints
+                    } else {
+                        &[]
+                    },
+                    &p.route,
+                    &p.checkpoints,
+                    &p.edges,
+                );
+                if bounds.is_empty() && !self.identity.has_unconfigured_default_location() {
+                    bounds.push((self.identity.anchor_lat, self.identity.anchor_lon));
                 }
-                if bounds.is_empty() {
-                    bounds = super::map::collect_bounds(&p.edges);
-                    bounds.extend(p.route.iter().copied());
-                    bounds.extend(p.checkpoints.iter().copied());
+                if !bounds.is_empty() {
+                    self.run_page.map.fit(canvas, &bounds);
+                    self.run_page.map_fitted = true;
                 }
-            }
-            if !bounds.is_empty() {
-                self.run_page.map.fit(canvas, &bounds);
-                self.run_page.map_fitted = true;
             }
         }
 
@@ -608,52 +754,73 @@ impl App {
                     .map
                     .draw_polygon(&painter, canvas, f, fence_c, 2.0);
             }
-            let route_c = egui::Color32::from_rgb(30, 111, 216);
-            self.run_page
-                .map
-                .draw_polyline(&painter, canvas, &p.route, route_c, 2.5);
             let cp = egui::Color32::from_rgb(240, 180, 0);
             for &(la, lo) in &p.checkpoints {
                 self.run_page
                     .map
-                    .draw_point(&painter, canvas, la, lo, cp, 3.5);
+                    .draw_point(&painter, canvas, la, lo, cp, 3.8);
             }
-            if let Some(first) = p.route.first() {
-                self.run_page.map.draw_point(
-                    &painter,
-                    canvas,
-                    first.0,
-                    first.1,
-                    egui::Color32::from_rgb(22, 160, 90),
-                    4.5,
-                );
+            let route_c = egui::Color32::from_rgb(30, 111, 216);
+            if p.route.len() >= 2 {
+                self.run_page
+                    .map
+                    .draw_route_with_arrows(&painter, canvas, &p.route, route_c, 2.5);
             }
-            if let Some(last) = p.route.last() {
-                self.run_page.map.draw_point(
-                    &painter,
-                    canvas,
-                    last.0,
-                    last.1,
-                    egui::Color32::from_rgb(220, 38, 38),
-                    4.5,
-                );
+            if is_custom {
+                self.run_page
+                    .map
+                    .draw_waypoints(&painter, canvas, &self.config.custom_waypoints);
+            } else {
+                if let Some(first) = p.route.first() {
+                    self.run_page.map.draw_point(
+                        &painter,
+                        canvas,
+                        first.0,
+                        first.1,
+                        egui::Color32::from_rgb(22, 160, 90),
+                        4.5,
+                    );
+                }
+                if let Some(last) = p.route.last() {
+                    self.run_page.map.draw_point(
+                        &painter,
+                        canvas,
+                        last.0,
+                        last.1,
+                        egui::Color32::from_rgb(220, 38, 38),
+                        4.5,
+                    );
+                }
             }
-            let label = if p.length_m > 0.0 {
+
+            let label = if let Some(err) = &p.route_error {
+                err.clone()
+            } else if p.length_m > 0.0 {
                 let loops = plan.dist * 1000.0 / p.length_m;
                 if loops > 1.15 {
                     format!(
-                        "本次方案 {:.2} km · 单圈 {:.0} m × {:.1} 圈 · {} 打卡点",
+                        "本次方案 {:.2} km · 单圈 {:.0} m × {:.1} 圈 · {} 打卡点{}",
                         plan.dist,
                         p.length_m,
                         loops,
-                        p.checkpoints.len()
+                        p.checkpoints.len(),
+                        if is_custom {
+                            format!(" · {} 途经点", self.config.custom_waypoints.len())
+                        } else {
+                            String::new()
+                        }
                     )
                 } else {
                     format!(
-                        "本次方案 {:.2} km · 路线 {:.0} m · {} 打卡点",
+                        "本次方案 {:.2} km · 路线 {:.0} m · {} 打卡点{}",
                         plan.dist,
                         p.length_m,
-                        p.checkpoints.len()
+                        p.checkpoints.len(),
+                        if is_custom {
+                            format!(" · {} 途经点", self.config.custom_waypoints.len())
+                        } else {
+                            String::new()
+                        }
                     )
                 }
             } else {
@@ -680,7 +847,37 @@ impl App {
             );
         }
 
-        self.run_page.map.interact(ui, canvas);
+        self.run_page.map.draw_scale_bar(&painter, canvas);
+        self.run_page.map.draw_hud_footer(&painter, canvas, is_custom);
+
+        if is_custom {
+            let net_ref = self.network.clone();
+            let clip_fence = self.config.custom_clip_fence;
+            let snap_road_enabled = self.osm_page.snap_road && net_ref.is_some();
+            let snap_closure = |lat: f64, lon: f64| -> Option<((f64, f64), f64)> {
+                let net = net_ref.as_deref()?;
+                snap_point_to_aligned_road(net, &fences, clip_fence, lat, lon)
+            };
+            let snap_fn: Option<&dyn Fn(f64, f64) -> Option<((f64, f64), f64)>> =
+                if snap_road_enabled {
+                    Some(&snap_closure)
+                } else {
+                    None
+                };
+            let edit = self.run_page.map.interact_planner(
+                ui,
+                canvas,
+                &response,
+                &mut self.config.custom_waypoints,
+                &pts_bd,
+                snap_fn,
+            );
+            if edit.changed() {
+                self.sync_custom_route_config();
+            }
+        } else {
+            self.run_page.map.interact(ui, canvas);
+        }
     }
 
     fn start_run(&mut self) {
@@ -714,11 +911,7 @@ impl App {
         self.config.face_check = page.face_check;
         self.config.manual_altitude = manual_altitude;
         self.config.manual_altitude_range = manual_altitude_range;
-        self.config.route_mode = if route_mode == RouteMode::Road {
-            "road".into()
-        } else {
-            "legacy".into()
-        };
+        self.config.route_mode = route_mode.as_str().into();
         let _ = crate::api::model::save_config(&self.config);
 
         let identity = self.identity.clone();

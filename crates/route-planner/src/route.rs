@@ -306,3 +306,109 @@ pub fn plan_loop(
 pub fn path_coords(g: &RoadGraph, path: &[NodeIndex]) -> Vec<Coord> {
     path.iter().map(|&n| g.node_coord(n)).collect()
 }
+
+/// 自定义路径的闭合/延展方式。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum CustomCloseMode {
+    /// 闭合环线：按序连接全部途经点后，沿最短道路回到起点形成闭环。
+    #[default]
+    Loop,
+    /// 原路折返：按序从起点到终点，再沿原路返回起点（往返闭合）。
+    OutAndBack,
+    /// 自动凑距闭环：按序经过全部途经点后，若长度不足目标距离则自动在路网游走补足再回到起点。
+    AutoPadLoop,
+}
+
+impl CustomCloseMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "out_and_back" => CustomCloseMode::OutAndBack,
+            "auto_pad" => CustomCloseMode::AutoPadLoop,
+            _ => CustomCloseMode::Loop,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CustomCloseMode::Loop => "loop",
+            CustomCloseMode::OutAndBack => "out_and_back",
+            CustomCloseMode::AutoPadLoop => "auto_pad",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CustomCloseMode::Loop => "闭合环线（自动回起点）",
+            CustomCloseMode::OutAndBack => "原路折返（往返路线）",
+            CustomCloseMode::AutoPadLoop => "自动凑距闭环（必经+游走）",
+        }
+    }
+}
+
+/// 按用户指定的有序途经点序列生成节点路径。
+pub fn plan_custom_nodes(
+    g: &RoadGraph,
+    vnodes: &[NodeIndex],
+    mode: CustomCloseMode,
+    target_len_m: f64,
+    seed: u64,
+    opts: &RouteOptions,
+) -> Result<Vec<NodeIndex>, String> {
+    if vnodes.is_empty() {
+        return Err("请先在地图上点击添加途经点".into());
+    }
+    let start = vnodes[0];
+    if mode == CustomCloseMode::AutoPadLoop {
+        let must: Vec<NodeIndex> = vnodes[1..]
+            .iter()
+            .copied()
+            .filter(|&n| n != start)
+            .collect();
+        return plan_loop(g, start, &must, &[], target_len_m, seed, opts);
+    }
+    if vnodes.len() < 2 {
+        return Err("请至少在地图上添加 2 个途经点（或切换为「自动凑距闭环」）".into());
+    }
+
+    let mut forward = vec![start];
+    let mut cur = start;
+    for (idx, &target) in vnodes.iter().enumerate().skip(1) {
+        if target == cur {
+            continue;
+        }
+        let seg = shortest_path(g, cur, target).ok_or_else(|| {
+            format!(
+                "途经点 #{} → #{} 之间道路不连通（请检查是否跨围栏或断头路）",
+                idx,
+                idx + 1
+            )
+        })?;
+        forward.extend(seg.into_iter().skip(1));
+        cur = target;
+    }
+
+    if forward.len() < 2 {
+        return Err("途经点重合，请添加不同位置的途经点".into());
+    }
+
+    match mode {
+        CustomCloseMode::Loop => {
+            if cur != start {
+                let back = shortest_path(g, cur, start)
+                    .ok_or_else(|| "终点无法沿道路回到起点，请调整途经点或改用「原路折返」".to_string())?;
+                forward.extend(back.into_iter().skip(1));
+            }
+            Ok(forward)
+        }
+        CustomCloseMode::OutAndBack => {
+            let mut full = forward.clone();
+            if forward.len() >= 2 {
+                for &n in forward[..forward.len() - 1].iter().rev() {
+                    full.push(n);
+                }
+            }
+            Ok(full)
+        }
+        CustomCloseMode::AutoPadLoop => unreachable!(),
+    }
+}
