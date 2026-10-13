@@ -966,11 +966,18 @@ impl App {
                 } else {
                     None
                 };
+            let route_slice: Vec<(f64, f64)> = self
+                .run_page
+                .preview
+                .as_ref()
+                .map(|p| p.route.clone())
+                .unwrap_or_default();
             let edit = self.run_page.map.interact_planner(
                 ui,
                 canvas,
                 &response,
                 &mut self.config.custom_waypoints,
+                &route_slice,
                 &pts_bd,
                 snap_fn,
             );

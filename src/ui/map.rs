@@ -85,6 +85,10 @@ pub struct MapState {
     pub dragging_wp: Option<usize>,
     /// 当前鼠标悬停的途经点下标。
     pub hover_wp: Option<usize>,
+    /// 当前鼠标悬停命中的已有路径段：`(插入下标 insert_idx, 屏幕投影点, 经纬度)`。
+    pub hover_segment: Option<(usize, Pos2, (f64, f64))>,
+    /// 本次按下左键是否已在路径段上直接插入了控制点（防止松开时重复在末尾追加）。
+    pub inserted_on_press: bool,
     /// 当前鼠标所在的地图经纬度 `(lat, lon)`。
     pub hover_coord: Option<(f64, f64)>,
 }
@@ -98,6 +102,8 @@ impl Default for MapState {
             dragged: false,
             dragging_wp: None,
             hover_wp: None,
+            hover_segment: None,
+            inserted_on_press: false,
             hover_coord: None,
         }
     }
@@ -685,17 +691,20 @@ impl MapState {
     }
 
     /// 处理路径规划交互：
-    /// - 左键点击地图空白处：新增途经点（靠近打卡点自动吸附，启用道路吸附时自动落路）；
+    /// - 鼠标悬停在已有路径曲线上：显示 `+` 预览点，左键点击或按住直接拖拽即可在该段中间插入控制点并实时拉弯曲线（类似修图曲线工具）；
+    /// - 左键点击地图空白处：在路径末尾新增途经点（靠近打卡点自动吸附，启用道路吸附时自动落路）；
     /// - 左键按住已有途经点拖拽：实时移动该途经点；
     /// - 左键按住空白处拖拽：平移地图；
     /// - 右键点击途经点：删除该途经点（在空白处右键则撤销最后一个途经点）；
     /// - 滚轮：以鼠标指针为中心缩放地图。
+    #[allow(clippy::too_many_arguments)]
     pub fn interact_planner(
         &mut self,
         ui: &egui::Ui,
         rect: Rect,
         response: &egui::Response,
         waypoints: &mut Vec<(f64, f64)>,
+        route: &[(f64, f64)],
         checkpoints: &[(f64, f64)],
         snap_road: Option<&dyn Fn(f64, f64) -> Option<((f64, f64), f64)>>,
     ) -> PlannerEdit {
@@ -718,7 +727,7 @@ impl MapState {
 
         self.hover_coord = pointer_pos.map(|p| self.from_screen(rect, p));
 
-        // 命中检测：查找距离光标 14px 内的途经点
+        // 命中检测：1) 优先查找距离光标 14px 内的已有途经点；2) 否则查找距离光标 11px 内的路径曲线段
         if self.dragging_wp.is_none() {
             self.hover_wp = pointer_pos.and_then(|pos| {
                 let mut best: Option<(usize, f32)> = None;
@@ -731,12 +740,30 @@ impl MapState {
                 }
                 best.map(|(i, _)| i)
             });
+            if self.hover_wp.is_none() {
+                self.hover_segment = pointer_pos
+                    .and_then(|pos| self.find_route_segment_hit(rect, pos, waypoints, route));
+            } else {
+                self.hover_segment = None;
+            }
         }
 
-        // 按下左键瞬间：若命中已有途经点，进入途经点拖拽态
+        // 按下左键瞬间：
+        // - 若命中已有途经点，进入该途经点的拖拽态；
+        // - 若命中路径曲线段，像修图曲线一样立即在该段插入新控制点并直接进入拖拽态！
         if primary_pressed {
+            self.inserted_on_press = false;
             if let Some(idx) = self.hover_wp {
                 self.dragging_wp = Some(idx);
+            } else if let Some((insert_idx, proj_pos, _)) = self.hover_segment {
+                let pt = self.resolve_point(rect, proj_pos, checkpoints, snap_road);
+                let idx = insert_idx.min(waypoints.len());
+                waypoints.insert(idx, pt);
+                self.dragging_wp = Some(idx);
+                self.hover_wp = Some(idx);
+                self.hover_segment = None;
+                self.inserted_on_press = true;
+                edit = PlannerEdit::Added(idx);
             }
         }
 
@@ -750,7 +777,9 @@ impl MapState {
                                 || (waypoints[idx].1 - pt.1).abs() > 1e-8
                             {
                                 waypoints[idx] = pt;
-                                edit = PlannerEdit::Moved(idx);
+                                if matches!(edit, PlannerEdit::None) {
+                                    edit = PlannerEdit::Moved(idx);
+                                }
                             }
                             self.dragged = true;
                         }
@@ -775,6 +804,7 @@ impl MapState {
 
         // 右键删除：优先删除悬停的途经点，否则撤销末尾途经点
         if response.secondary_clicked() {
+            self.inserted_on_press = false;
             if let Some(idx) = self.hover_wp.filter(|&i| i < waypoints.len()) {
                 waypoints.remove(idx);
                 self.hover_wp = None;
@@ -787,8 +817,12 @@ impl MapState {
             }
         }
 
-        // 左键点击空白或打卡点：新增途经点
-        if response.clicked() && !self.dragged && self.dragging_wp.is_none() {
+        // 左键点击空白处（未命中已有节点且未在按下时插点）：在末尾新增途经点
+        if response.clicked()
+            && !self.dragged
+            && self.dragging_wp.is_none()
+            && !self.inserted_on_press
+        {
             if let Some(pos) = response.interact_pointer_pos().filter(|p| rect.contains(*p)) {
                 if self.hover_wp.is_none() {
                     let pt = self.resolve_point(rect, pos, checkpoints, snap_road);
@@ -797,8 +831,90 @@ impl MapState {
                 }
             }
         }
+        if !primary_down {
+            self.inserted_on_press = false;
+        }
 
         edit
+    }
+
+    /// 查找鼠标指针 `pos` 是否落在已有路径段 11px 内，并定位其所属的 `waypoints` 插入下标 `insert_idx`。
+    pub fn find_route_segment_hit(
+        &self,
+        rect: Rect,
+        pos: Pos2,
+        waypoints: &[(f64, f64)],
+        route: &[(f64, f64)],
+    ) -> Option<(usize, Pos2, (f64, f64))> {
+        let m = waypoints.len();
+        if m < 2 {
+            return None;
+        }
+        let hit_radius = 11.0f32;
+
+        // 若有渲染路线点列，先建立每个途经点在 route 上的单调分界索引
+        if route.len() >= 2 {
+            let k_len = route.len();
+            let mut wp_splits: Vec<usize> = Vec::with_capacity(m);
+            // Catmull-Rom 固定每段 18 采样点时直接精确映射（即使跑圈多层重叠也能定位到对应圈段）
+            if k_len == (m - 1) * 18 + 1 || k_len == m * 18 + 1 {
+                for j in 0..m {
+                    wp_splits.push((j * 18).min(k_len - 1));
+                }
+            } else {
+                wp_splits.push(0);
+                let mut cur_k = 0usize;
+                for &(wlat, wlon) in waypoints.iter().skip(1) {
+                    let mut best_k = cur_k;
+                    let mut best_d = f64::INFINITY;
+                    for (idx, &(rlat, rlon)) in route.iter().enumerate().skip(cur_k) {
+                        let d = (rlat - wlat).powi(2) + (rlon - wlon).powi(2);
+                        if d < best_d {
+                            best_d = d;
+                            best_k = idx;
+                        }
+                    }
+                    cur_k = best_k;
+                    wp_splits.push(cur_k);
+                }
+            }
+
+            let mut best_hit: Option<(usize, Pos2, f32)> = None;
+            for seg_k in 0..(k_len - 1) {
+                let a = self.to_screen(rect, route[seg_k].0, route[seg_k].1);
+                let b = self.to_screen(rect, route[seg_k + 1].0, route[seg_k + 1].1);
+                let proj = project_pos2_to_segment(pos, a, b);
+                let d = pos.distance(proj);
+                if d <= hit_radius && best_hit.map_or(true, |(_, _, bd)| d < bd) {
+                    // 查找 seg_k 落在哪两个途经点之间：wp_splits[j-1] <= seg_k < wp_splits[j]
+                    let mut insert_idx = m;
+                    for j in 1..m {
+                        if seg_k < wp_splits[j] {
+                            insert_idx = j;
+                            break;
+                        }
+                    }
+                    best_hit = Some((insert_idx, proj, d));
+                }
+            }
+            if let Some((insert_idx, proj, _)) = best_hit {
+                let coord = self.from_screen(rect, proj);
+                return Some((insert_idx, proj, coord));
+            }
+        }
+
+        // 兜底：直接检测相邻途经点连线弦
+        let mut best_chord: Option<(usize, Pos2, f32)> = None;
+        for j in 1..m {
+            let a = self.to_screen(rect, waypoints[j - 1].0, waypoints[j - 1].1);
+            let b = self.to_screen(rect, waypoints[j].0, waypoints[j].1);
+            let proj = project_pos2_to_segment(pos, a, b);
+            let d = pos.distance(proj);
+            if d <= hit_radius && best_chord.map_or(true, |(_, _, bd)| d < bd) {
+                best_chord = Some((j, proj, d));
+            }
+        }
+        best_chord.map(|(insert_idx, proj, _)| (insert_idx, proj, self.from_screen(rect, proj)))
     }
 
     /// 将屏幕像素位置解析为经纬度：优先吸附 14px 内的打卡点，其次吸附 150m 内的道路。
@@ -982,6 +1098,39 @@ impl MapState {
                 Color32::WHITE,
             );
         }
+
+        // 当鼠标悬停在路径曲线上时，绘制「+」插点预览控制点（修图曲线手感）
+        if self.dragging_wp.is_none() && self.hover_wp.is_none() {
+            if let Some((insert_idx, proj_pos, _)) = self.hover_segment {
+                if rect.contains(proj_pos) {
+                    let preview_c = Color32::from_rgb(14, 165, 233);
+                    clipped.circle_stroke(
+                        proj_pos,
+                        11.5,
+                        Stroke::new(
+                            2.0_f32,
+                            Color32::from_rgba_unmultiplied(14, 165, 233, 130),
+                        ),
+                    );
+                    clipped.circle_filled(proj_pos, 8.5, preview_c);
+                    clipped.circle_stroke(proj_pos, 8.5, Stroke::new(1.8_f32, Color32::WHITE));
+                    clipped.text(
+                        proj_pos,
+                        Align2::CENTER_CENTER,
+                        "＋",
+                        FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                    clipped.text(
+                        Pos2::new(proj_pos.x, proj_pos.y - 16.0),
+                        Align2::CENTER_BOTTOM,
+                        format!("插入 #{}", insert_idx + 1),
+                        FontId::proportional(10.5),
+                        Color32::from_rgb(12, 110, 165),
+                    );
+                }
+            }
+        }
     }
 
     /// 在地图左下角绘制自适应米制比例尺。
@@ -1056,6 +1205,17 @@ impl MapState {
             Color32::from_rgb(75, 88, 84),
         );
     }
+}
+
+/// 屏幕像素点 `p` 到线段 `a-b` 的垂足投影点。
+fn project_pos2_to_segment(p: Pos2, a: Pos2, b: Pos2) -> Pos2 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 <= 1e-6 {
+        return a;
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    a + ab * t
 }
 
 /// 2D 任意多边形耳切三角剖分（支持凹多边形建筑/水域轮廓）。
@@ -1225,5 +1385,30 @@ mod tests {
         ];
         let tris = triangulate_earclip(&poly);
         assert_eq!(tris.len(), (poly.len() - 2) * 3);
+    }
+
+    #[test]
+    fn route_segment_hit_identifies_correct_insertion_index() {
+        let mut map = MapState::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        let wps = vec![
+            (38.888000, 121.528000),
+            (38.888000, 121.531000),
+            (38.891000, 121.531000),
+        ];
+        map.fit(rect, &wps);
+
+        // 在第 0 点与第 1 点连线中点附近悬停，应返回 insert_idx = 1（即作为新的第 2 个点插入）
+        let p0 = map.to_screen(rect, wps[0].0, wps[0].1);
+        let p1 = map.to_screen(rect, wps[1].0, wps[1].1);
+        let mid01 = Pos2::new((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5 + 3.0);
+        let hit01 = map.find_route_segment_hit(rect, mid01, &wps, &wps).unwrap();
+        assert_eq!(hit01.0, 1);
+
+        // 在第 1 点与第 2 点连线中点附近悬停，应返回 insert_idx = 2（即作为新的第 3 个点插入）
+        let p2 = map.to_screen(rect, wps[2].0, wps[2].1);
+        let mid12 = Pos2::new((p1.x + p2.x) * 0.5 - 4.0, (p1.y + p2.y) * 0.5);
+        let hit12 = map.find_route_segment_hit(rect, mid12, &wps, &wps).unwrap();
+        assert_eq!(hit12.0, 2);
     }
 }
