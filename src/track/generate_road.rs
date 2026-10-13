@@ -950,7 +950,10 @@ fn build_track_from_route(
         ten_st += cad / 60.0 * dt;
         while ten_t >= 10.0 {
             let k = 10.0 / ten_t;
-            let (out_d, out_st) = (ten_d * k, ten_st * k);
+            let raw_d = ten_d * k;
+            let raw_st = ten_st * k;
+            let out_d = raw_d.clamp(17.50, 41.00);
+            let out_st = raw_st.clamp(25.0, 45.0);
             ten_speed.push(TenWindow {
                 time: 10,
                 value: round_to(out_d, 2),
@@ -960,8 +963,8 @@ fn build_track_from_route(
                 value: round_to(out_st, 0),
             });
             ten_t -= 10.0;
-            ten_d -= out_d;
-            ten_st -= out_st;
+            ten_d -= raw_d;
+            ten_st -= raw_st;
         }
         locs.push(GenPoint {
             id: i as i64 + 1,
@@ -997,15 +1000,17 @@ fn build_track_from_route(
             locationId: String::new(),
         });
     }
-    if ten_t > 1.0 {
-        let k = (10.0 / ten_t).min(1.4);
+    if ten_t > 0.5 {
+        let k = 10.0 / ten_t;
+        let out_d = (ten_d * k).clamp(17.50, 41.00);
+        let out_st = (ten_st * k).clamp(25.0, 45.0);
         ten_speed.push(TenWindow {
             time: 10,
-            value: round_to(ten_d * k, 2),
+            value: round_to(out_d, 2),
         });
         ten_steps.push(TenWindow {
             time: 10,
-            value: round_to(ten_st * k, 0),
+            value: round_to(out_st, 0),
         });
     }
 

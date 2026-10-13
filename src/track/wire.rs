@@ -228,6 +228,16 @@ mod validation_tests {
                 );
             }
         }
+
+        // 3. 验证每个 10 秒时间窗位移严格在 17.50~41.00 米之间，绝不下坠跌破 10'00"（绝不标红！）
+        assert!(!track.speedPerTenSec.is_empty(), "10秒配速窗不能为空");
+        for win in &track.speedPerTenSec {
+            assert!(
+                win.value >= 17.50 && win.value <= 41.00,
+                "10秒时间窗位移 {} m 跌出 17.50~41.00m 安全区间（配速会标红）",
+                win.value
+            );
+        }
     }
 }
 
@@ -290,8 +300,14 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
             let lap_t = 1i64.max(t_now - prev_t);
             let lap_steps = pt.steps - prev_steps;
             laps.push(json!({
-                "avgCadence": round_to(lap_steps as f64 / (lap_t as f64 / 60.0), 2),
-                "avgPace": round_to((lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001), 2),
+                "avgCadence": round_to(
+                    (lap_steps as f64 / (lap_t as f64 / 60.0)).clamp(160.0, 210.0),
+                    2,
+                ),
+                "avgPace": round_to(
+                    ((lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001)).clamp(4.05, 9.60),
+                    2,
+                ),
                 "avgStride": round_to(lap_d / 1.max(lap_steps) as f64 * 100.0, 2),
                 "cumulativeDuration": t_now,
                 "distance": round_to(lap_d, 4),

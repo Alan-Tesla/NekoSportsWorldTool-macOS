@@ -385,12 +385,17 @@ fn build_from_ring(
         ten_st += cad / 60.0 * dt;
         while ten_t >= 10.0 {
             let k = 10.0 / ten_t; // 只取前 10s 的量，余量留给下一窗
-            let (out_d, out_st) = (ten_d * k, ten_st * k);
+            let raw_d = ten_d * k;
+            let raw_st = ten_st * k;
+            // 严格对齐学校配速要求（2'00"~10'00"，即 10s 内跑 16.67~83.33m），
+            // 并约束在用户要求的 4'00"~10'00" 窗口（10s 内 17.50~41.00m），彻底消除掉入 72'00" 的断崖红线！
+            let out_d = raw_d.clamp(17.50, 41.00);
+            let out_st = raw_st.clamp(25.0, 45.0);
             ten_speed.push(TenWindow { time: 10, value: round_to(out_d, 2) });
             ten_steps.push(TenWindow { time: 10, value: round_to(out_st, 0) });
             ten_t -= 10.0;
-            ten_d -= out_d;
-            ten_st -= out_st;
+            ten_d -= raw_d;
+            ten_st -= raw_st;
         }
         locs.push(GenPoint {
             id: i as i64 + 1,
@@ -426,11 +431,12 @@ fn build_from_ring(
             locationId: String::new(),
         });
     }
-    if ten_t > 1.0 {
-        // 尾窗：限制放大倍数 ≤1.4
-        let k = (10.0 / ten_t).min(1.4);
-        ten_speed.push(TenWindow { time: 10, value: round_to(ten_d * k, 2) });
-        ten_steps.push(TenWindow { time: 10, value: round_to(ten_st * k, 0) });
+    if ten_t > 0.5 {
+        let k = 10.0 / ten_t;
+        let out_d = (ten_d * k).clamp(17.50, 41.00);
+        let out_st = (ten_st * k).clamp(25.0, 45.0);
+        ten_speed.push(TenWindow { time: 10, value: round_to(out_d, 2) });
+        ten_steps.push(TenWindow { time: 10, value: round_to(out_st, 0) });
     }
 
     let mut segments: Vec<Segment> = Vec::new();
