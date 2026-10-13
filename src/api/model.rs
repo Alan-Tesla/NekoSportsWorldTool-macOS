@@ -89,6 +89,9 @@ pub struct Config {
     /// 自定义路径是否受电子围栏裁剪。
     #[serde(default = "default_true")]
     pub custom_clip_fence: bool,
+    /// 自定义路径是否启用道路吸附与沿路网寻路（false = 自由手绘/操场跑圈模式，点哪走哪）。
+    #[serde(default)]
+    pub custom_snap_road: bool,
     /// 地图底图源：gaode | osm | vector。
     #[serde(default = "default_tile_source")]
     pub tile_source: String,
@@ -150,6 +153,7 @@ impl Default for Config {
             custom_waypoints: Vec::new(),
             custom_close_mode: default_custom_close_mode(),
             custom_clip_fence: true,
+            custom_snap_road: false,
             tile_source: default_tile_source(),
         }
     }

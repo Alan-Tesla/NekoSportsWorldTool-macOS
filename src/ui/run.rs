@@ -7,7 +7,7 @@
 use super::map::{collect_scene_bounds, MapState, TileSource};
 use super::{mobile, theme, App};
 use crate::track::generate_road::{
-    plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RouteMode,
+    make_playground_oval, plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RouteMode,
 };
 use chrono::{Datelike, Duration, Local, TimeZone, Timelike};
 use eframe::egui;
@@ -543,15 +543,28 @@ impl App {
             let mut close_mode = CustomCloseMode::from_str(&self.config.custom_close_mode);
             let prev_close = close_mode;
             let prev_clip = self.config.custom_clip_fence;
+            let prev_snap = self.config.custom_snap_road;
             let mut need_sync = false;
             let mut chain_cp = false;
+            let mut gen_playground = false;
             let mut open_big_map = false;
 
             ui.add_space(4.0);
             mobile::row(ui, |ui| {
-                ui.label("规划：");
+                ui.label("方式：");
+                ui.selectable_value(
+                    &mut self.config.custom_snap_road,
+                    false,
+                    "自由手绘/操场",
+                )
+                .on_hover_text("点哪走哪，适合在操场跑圈或手绘任意路径");
+                ui.selectable_value(&mut self.config.custom_snap_road, true, "沿道路寻路")
+                    .on_hover_text("自动吸附到 OSM 道路并计算最短路径");
+                if self.config.custom_snap_road && self.network.is_some() {
+                    ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
+                }
                 egui::ComboBox::from_id_salt("run_custom_close_mode")
-                    .width(175.0)
+                    .width(160.0)
                     .selected_text(close_mode.label())
                     .show_ui(ui, |ui| {
                         for m in [
@@ -562,9 +575,12 @@ impl App {
                             ui.selectable_value(&mut close_mode, m, m.label());
                         }
                     });
-                if self.network.is_some() {
-                    ui.checkbox(&mut self.osm_page.snap_road, "道路吸附");
-                    ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
+                if ui
+                    .small_button("生成操场跑圈")
+                    .on_hover_text("在操场中心点 1 个点（或沿长轴点 2 个点）后点击，一键生成 400m 跑道")
+                    .clicked()
+                {
+                    gen_playground = true;
                 }
                 if ui
                     .small_button("串联打卡点")
@@ -615,7 +631,24 @@ impl App {
                 self.config.custom_close_mode = close_mode.as_str().into();
                 need_sync = true;
             }
+            if self.config.custom_snap_road != prev_snap {
+                self.osm_page.snap_road = self.config.custom_snap_road;
+                need_sync = true;
+            }
             if self.config.custom_clip_fence != prev_clip {
+                need_sync = true;
+            }
+            if gen_playground {
+                let fallback = if self.run_page.map.center != (0.0, 0.0) {
+                    self.run_page.map.center
+                } else {
+                    (self.identity.anchor_lat, self.identity.anchor_lon)
+                };
+                self.config.custom_waypoints =
+                    make_playground_oval(&self.config.custom_waypoints, fallback);
+                self.config.custom_snap_road = false;
+                self.osm_page.snap_road = false;
+                self.config.custom_close_mode = CustomCloseMode::Loop.as_str().into();
                 need_sync = true;
             }
             if chain_cp {
@@ -647,6 +680,7 @@ impl App {
                     &pts_bd,
                     &fences,
                     self.config.custom_clip_fence,
+                    self.config.custom_snap_road,
                     close_mode,
                     plan.dist * 1000.0,
                     plan.seed,
@@ -881,7 +915,7 @@ impl App {
         if is_custom {
             let net_ref = self.network.clone();
             let clip_fence = self.config.custom_clip_fence;
-            let snap_road_enabled = self.osm_page.snap_road && net_ref.is_some();
+            let snap_road_enabled = self.config.custom_snap_road && net_ref.is_some();
             let snap_closure = |lat: f64, lon: f64| -> Option<((f64, f64), f64)> {
                 let net = net_ref.as_deref()?;
                 snap_point_to_aligned_road(net, &fences, clip_fence, lat, lon)

@@ -174,9 +174,9 @@ pub fn plan_road_view(
 }
 
 /// 生成自定义路径规划预览：
-/// - 若已加载 OSM 路网，则对齐到 BD-09（可选围栏裁剪）并沿真实道路按序连接 `waypoints_bd`；
-/// - 若未加载 OSM 路网，则按 `waypoints_bd` 拟合平滑闭合环或折返折线；
-/// - 即使途经点不足或寻路报错，仍返回完整的底图要素（道路/建筑/打卡点/围栏）供交互点击。
+/// - 若 `snap_road = true` 且已加载 OSM 路网，则对齐到 BD-09（可选围栏裁剪）并沿真实道路按序连接 `waypoints_bd`；
+/// - 若 `snap_road = false`（自由手绘 / 操场跑圈模式）或未加载 OSM 路网，则严格按用户点击的 `waypoints_bd` 原始位置拟合平滑闭合环或折返路线（仍保留底图道路/建筑/操场显示，不强制吸附到外部道路）；
+/// - 即使途经点不足或寻路报错，仍返回完整的底图要素供交互点击。
 #[allow(clippy::too_many_arguments)]
 pub fn plan_custom_view(
     net: Option<&RoadGraph>,
@@ -184,45 +184,40 @@ pub fn plan_custom_view(
     checkpoints_bd: &[(f64, f64)],
     fences: &[Vec<(f64, f64)>],
     clip_fence: bool,
+    snap_road: bool,
     close_mode: CustomCloseMode,
     dist_m: f64,
     seed: u64,
 ) -> RoadPlan {
     let ordered_cp = radial_order(checkpoints_bd);
-    if let Some(raw_net) = net {
-        let mut g = raw_net.clone();
-        align_network(&mut g);
-        if clip_fence {
-            g = apply_fences(&g, fences);
-        }
-        let (edges, buildings, waters, greens, pitches, labels) = extract_map_features(&g);
-        if waypoints_bd.is_empty() {
-            return RoadPlan {
-                route: Vec::new(),
-                length_m: 0.0,
-                edges,
-                buildings,
-                waters,
-                greens,
-                pitches,
-                labels,
-                checkpoints: ordered_cp,
-                fences: fences.to_vec(),
-                route_error: Some("左键点击地图添加起点与途经点，拖拽可调整位置，右键删除".into()),
-            };
-        }
-        let wp_coords: Vec<Coord> = waypoints_bd
-            .iter()
-            .map(|&(lat, lon)| Coord::new(lon, lat))
-            .collect();
-        let opts = RouteOptions::default();
-        match plan_custom_route(&g, &wp_coords, close_mode, dist_m, seed, &opts) {
-            Ok(route) => {
-                let route_pts: Vec<(f64, f64)> =
-                    route.points.iter().map(|p| (p.lat, p.lon)).collect();
-                RoadPlan {
-                    route: route_pts,
-                    length_m: route.length_m,
+    let (edges, buildings, waters, greens, pitches, labels, aligned_net) =
+        if let Some(raw_net) = net {
+            let mut g = raw_net.clone();
+            align_network(&mut g);
+            if clip_fence {
+                g = apply_fences(&g, fences);
+            }
+            let (e, b, w, gr, p, l) = extract_map_features(&g);
+            (e, b, w, gr, p, l, Some(g))
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+        };
+
+    // 模式 1：开启了「沿道路寻路」且已加载 OSM 路网
+    if snap_road {
+        if let Some(g) = aligned_net {
+            if waypoints_bd.is_empty() {
+                return RoadPlan {
+                    route: Vec::new(),
+                    length_m: 0.0,
                     edges,
                     buildings,
                     waters,
@@ -231,56 +226,166 @@ pub fn plan_custom_view(
                     labels,
                     checkpoints: ordered_cp,
                     fences: fences.to_vec(),
-                    route_error: None,
-                }
+                    route_error: Some(
+                        "左键点击地图添加起点与途经点（当前为「沿道路寻路」，若进操场可切换为「自由手绘/操场」）"
+                            .into(),
+                    ),
+                };
             }
-            Err(e) => RoadPlan {
-                route: waypoints_bd.to_vec(),
-                length_m: 0.0,
-                edges,
-                buildings,
-                waters,
-                greens,
-                pitches,
-                labels,
-                checkpoints: ordered_cp,
-                fences: fences.to_vec(),
-                route_error: Some(e),
-            },
-        }
-    } else {
-        if waypoints_bd.len() < 2 {
-            return RoadPlan {
-                route: waypoints_bd.to_vec(),
-                length_m: 0.0,
-                checkpoints: ordered_cp,
-                fences: fences.to_vec(),
-                route_error: Some(
-                    "左键点击地图添加至少 2 个途经点即可规划路线（导入 OSM 后可沿真实道路寻路）"
-                        .into(),
-                ),
-                ..Default::default()
+            let wp_coords: Vec<Coord> = waypoints_bd
+                .iter()
+                .map(|&(lat, lon)| Coord::new(lon, lat))
+                .collect();
+            let opts = RouteOptions::default();
+            return match plan_custom_route(&g, &wp_coords, close_mode, dist_m, seed, &opts) {
+                Ok(route) => {
+                    let route_pts: Vec<(f64, f64)> =
+                        route.points.iter().map(|p| (p.lat, p.lon)).collect();
+                    RoadPlan {
+                        route: route_pts,
+                        length_m: route.length_m,
+                        edges,
+                        buildings,
+                        waters,
+                        greens,
+                        pitches,
+                        labels,
+                        checkpoints: ordered_cp,
+                        fences: fences.to_vec(),
+                        route_error: None,
+                    }
+                }
+                Err(e) => RoadPlan {
+                    route: waypoints_bd.to_vec(),
+                    length_m: 0.0,
+                    edges,
+                    buildings,
+                    waters,
+                    greens,
+                    pitches,
+                    labels,
+                    checkpoints: ordered_cp,
+                    fences: fences.to_vec(),
+                    route_error: Some(e),
+                },
             };
         }
-        let close_loop = close_mode != CustomCloseMode::OutAndBack;
-        let (dense, arcs, (cx, cy)) = make_ordered_ring(waypoints_bd, close_loop);
-        let mut route_pts: Vec<(f64, f64)> = dense
-            .iter()
-            .map(|&(x, y)| to_bd(x, y, cx, cy))
-            .collect();
-        if let Some(&first) = route_pts.first() {
-            route_pts.push(first);
-        }
-        let length_m = *arcs.last().unwrap_or(&0.0);
-        RoadPlan {
-            route: route_pts,
-            length_m,
+    }
+
+    // 模式 2：自由手绘 / 操场跑圈模式（不强制吸附道路，严格經過用户点击的每个点）
+    if waypoints_bd.len() < 2 {
+        return RoadPlan {
+            route: waypoints_bd.to_vec(),
+            length_m: 0.0,
+            edges,
+            buildings,
+            waters,
+            greens,
+            pitches,
+            labels,
             checkpoints: ordered_cp,
             fences: fences.to_vec(),
-            route_error: None,
-            ..Default::default()
-        }
+            route_error: Some(
+                "自由手绘/操场模式：左键点击任意位置（如操场跑道）添加至少 2 个点，或点「生成操场跑圈」"
+                    .into(),
+            ),
+        };
     }
+    let close_loop = close_mode != CustomCloseMode::OutAndBack;
+    let (dense, arcs, (cx, cy)) = make_ordered_ring(waypoints_bd, close_loop);
+    let mut route_pts: Vec<(f64, f64)> = dense
+        .iter()
+        .map(|&(x, y)| to_bd(x, y, cx, cy))
+        .collect();
+    if let Some(&first) = route_pts.first() {
+        route_pts.push(first);
+    }
+    let length_m = *arcs.last().unwrap_or(&0.0);
+    RoadPlan {
+        route: route_pts,
+        length_m,
+        edges,
+        buildings,
+        waters,
+        greens,
+        pitches,
+        labels,
+        checkpoints: ordered_cp,
+        fences: fences.to_vec(),
+        route_error: None,
+    }
+}
+
+/// 生成标准 400m 田径操场跑道椭圆点集（BD-09 `(lat, lon)`，共 12 个有序控制点）：
+/// - 若 `existing_wps` 有 1 个点：以该点为操场中心，默认南北向；
+/// - 若 `existing_wps` 有 2 个点：以两点中点为操场中心，两点连线方向为操场长轴方向；
+/// - 其他情况：以 `fallback_center` 为操场中心，默认南北向。
+pub fn make_playground_oval(
+    existing_wps: &[(f64, f64)],
+    fallback_center: (f64, f64),
+) -> Vec<(f64, f64)> {
+    let (center, axis_angle) = match existing_wps.len() {
+        1 => (existing_wps[0], std::f64::consts::FRAC_PI_2),
+        2 => {
+            let a = existing_wps[0];
+            let b = existing_wps[1];
+            let mid = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+            let dx = (b.1 - a.1) * MET_PER_DEG_LNG;
+            let dy = (b.0 - a.0) * MET_PER_DEG_LAT;
+            let ang = if dx.hypot(dy) > 5.0 {
+                dy.atan2(dx)
+            } else {
+                std::f64::consts::FRAC_PI_2
+            };
+            (mid, ang)
+        }
+        _ => (fallback_center, std::f64::consts::FRAC_PI_2),
+    };
+
+    // 标准 400m 跑道：两条直道各 84.39m（半长 42.2m），两端半圆半径 36.5m
+    let half_straight = 42.2f64;
+    let radius = 36.5f64;
+    let local_pts: [(f64, f64); 12] = [
+        // 东侧/右侧直道（南→北）
+        (-half_straight, -radius),
+        (0.0, -radius),
+        (half_straight, -radius),
+        // 北侧弯道（3 个采样点）
+        (
+            half_straight + radius * 0.707,
+            -radius * 0.707,
+        ),
+        (half_straight + radius, 0.0),
+        (
+            half_straight + radius * 0.707,
+            radius * 0.707,
+        ),
+        // 西侧/左侧直道（北→南）
+        (half_straight, radius),
+        (0.0, radius),
+        (-half_straight, radius),
+        // 南侧弯道（3 个采样点）
+        (
+            -half_straight - radius * 0.707,
+            radius * 0.707,
+        ),
+        (-half_straight - radius, 0.0),
+        (
+            -half_straight - radius * 0.707,
+            -radius * 0.707,
+        ),
+    ];
+
+    let (sin_a, cos_a) = axis_angle.sin_cos();
+    local_pts
+        .iter()
+        .map(|&(u, v)| {
+            // u 沿长轴方向，v 垂直于长轴
+            let x = u * cos_a - v * sin_a;
+            let y = u * sin_a + v * cos_a;
+            to_bd(x, y, center.0, center.1)
+        })
+        .collect()
 }
 
 /// 将坐标点吸附到对齐后的 BD-09 路网最近道路上（距离阈值内生效）。
@@ -882,6 +987,7 @@ mod tests {
             &wps,
             &[],
             false,
+            false,
             CustomCloseMode::Loop,
             2000.0,
             7,
@@ -889,6 +995,26 @@ mod tests {
         assert!(view.route_error.is_none());
         assert!(view.length_m > 200.0);
         assert!(view.route.len() > 10);
+
+        // 测试生成 400m 标准操场跑道椭圆
+        let oval = make_playground_oval(&[(38.889000, 121.531000)], (38.889000, 121.531000));
+        assert_eq!(oval.len(), 12);
+        let oval_view = plan_custom_view(
+            None,
+            &oval,
+            &[],
+            &[],
+            false,
+            false,
+            CustomCloseMode::Loop,
+            2000.0,
+            7,
+        );
+        assert!(
+            (oval_view.length_m - 400.0).abs() < 45.0,
+            "操场跑道单圈长度应接近 400m，实际: {}",
+            oval_view.length_m
+        );
 
         let track = crate::track::generator::build_ordered(
             1500.0,

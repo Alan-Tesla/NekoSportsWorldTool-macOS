@@ -262,11 +262,16 @@ pub fn run_full_flow(
                 route_pts.clone()
             };
             log(&format!(
-                "[track] 自定义路径规划：{} 个途经点，模式={}",
+                "[track] 自定义路径规划：{} 个途经点，方式={}，模式={}",
                 custom_wps.len(),
+                if cfg.custom_snap_road {
+                    "沿道路寻路"
+                } else {
+                    "自由手绘/操场跑圈"
+                },
                 close_mode.label()
             ));
-            if !cfg.osm_path.is_empty() {
+            if cfg.custom_snap_road && !cfg.osm_path.is_empty() {
                 match crate::track::generate_road::load_network_path(&cfg.osm_path) {
                     Ok(mut net) => {
                         crate::track::generate_road::align_network(&mut net);

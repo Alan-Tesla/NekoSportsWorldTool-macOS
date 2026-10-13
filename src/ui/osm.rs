@@ -11,7 +11,8 @@ use route_planner::RoadGraph;
 use super::map::{collect_scene_bounds, MapState, TileSource};
 use super::{mobile, theme, App};
 use crate::track::generate_road::{
-    plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RoadPlan, RouteMode,
+    make_playground_oval, plan_custom_view, snap_point_to_aligned_road, CustomCloseMode, RoadPlan,
+    RouteMode,
 };
 
 pub struct OsmPage {
@@ -107,11 +108,13 @@ impl App {
         let mut tile_source = TileSource::from_str(&self.config.tile_source);
         let prev_tile = tile_source;
         let prev_clip = self.config.custom_clip_fence;
+        let prev_snap = self.config.custom_snap_road;
         let mut need_sync = false;
         let mut fit_requested = false;
         let mut zoom_delta: Option<f32> = None;
         let mut apply_to_run = false;
         let mut chain_checkpoints = false;
+        let mut gen_playground = false;
 
         ui.add_space(2.0);
         mobile::row(ui, |ui| {
@@ -131,9 +134,24 @@ impl App {
             ui.checkbox(&mut self.osm_page.show_road_overlay, "路网图层");
             ui.checkbox(&mut self.osm_page.show_labels, "名称标注");
             ui.separator();
-            ui.label("规划：");
+            ui.label("寻路方式：");
+            ui.selectable_value(
+                &mut self.config.custom_snap_road,
+                false,
+                "自由手绘/操场跑圈",
+            )
+            .on_hover_text("不强制吸附外部道路，可在操场或任意位置自由点选路径点");
+            ui.selectable_value(&mut self.config.custom_snap_road, true, "沿道路自动寻路")
+                .on_hover_text("将途经点吸附到 OSM 道路并自动计算最短道路连线");
+            if self.config.custom_snap_road {
+                ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
+            }
+        });
+
+        mobile::row(ui, |ui| {
+            ui.label("闭合：");
             egui::ComboBox::from_id_salt("osm_custom_close_mode")
-                .width(175.0)
+                .width(165.0)
                 .selected_text(close_mode.label())
                 .show_ui(ui, |ui| {
                     for m in [
@@ -144,11 +162,15 @@ impl App {
                         ui.selectable_value(&mut close_mode, m, m.label());
                     }
                 });
-            ui.checkbox(&mut self.osm_page.snap_road, "道路吸附");
-            ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
-        });
-
-        mobile::row(ui, |ui| {
+            if ui
+                .button("生成操场跑圈")
+                .on_hover_text(
+                    "在操场中心点 1 个点（或沿操场直道点 2 个点定方向）后点击，一键生成标准 400m 椭圆跑道",
+                )
+                .clicked()
+            {
+                gen_playground = true;
+            }
             if ui
                 .button("串联打卡点")
                 .on_hover_text("按环序将当前学校的打卡点填入途经点，可在此基础上拖拽微调")
@@ -209,6 +231,10 @@ impl App {
             self.config.custom_close_mode = close_mode.as_str().into();
             need_sync = true;
         }
+        if self.config.custom_snap_road != prev_snap {
+            self.osm_page.snap_road = self.config.custom_snap_road;
+            need_sync = true;
+        }
         if tile_source != prev_tile {
             self.config.tile_source = tile_source.as_str().into();
             let _ = crate::api::model::save_config(&self.config);
@@ -218,6 +244,20 @@ impl App {
         }
 
         let (pts_bd, fences) = self.cached_points_and_fences();
+        if gen_playground {
+            let fallback = if self.osm_page.map.center != (0.0, 0.0) {
+                self.osm_page.map.center
+            } else {
+                (self.identity.anchor_lat, self.identity.anchor_lon)
+            };
+            self.config.custom_waypoints =
+                make_playground_oval(&self.config.custom_waypoints, fallback);
+            self.config.custom_snap_road = false;
+            self.osm_page.snap_road = false;
+            self.config.custom_close_mode = CustomCloseMode::Loop.as_str().into();
+            close_mode = CustomCloseMode::Loop;
+            need_sync = true;
+        }
         if chain_checkpoints {
             if !pts_bd.is_empty() {
                 self.config.custom_waypoints =
@@ -257,6 +297,7 @@ impl App {
                 &pts_bd,
                 &fences,
                 self.config.custom_clip_fence,
+                self.config.custom_snap_road,
                 close_mode,
                 target_dist_m,
                 seed,
@@ -424,7 +465,7 @@ impl App {
         // ── 处理交互点击/拖拽/删除途经点 ─────────────────────────────
         let net_ref = self.network.clone();
         let clip_fence = self.config.custom_clip_fence;
-        let snap_road_enabled = self.osm_page.snap_road && net_ref.is_some();
+        let snap_road_enabled = self.config.custom_snap_road && net_ref.is_some();
         let snap_closure = |lat: f64, lon: f64| -> Option<((f64, f64), f64)> {
             let net = net_ref.as_deref()?;
             snap_point_to_aligned_road(net, &fences, clip_fence, lat, lon)

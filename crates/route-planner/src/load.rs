@@ -249,7 +249,10 @@ pub fn parse_osm(bytes: &[u8]) -> Result<ParsedOsm, String> {
                             {
                                 greens.push(refs.clone());
                             }
-                            if let Some(h) = get_tag("highway").map(|s| s.to_string()) {
+                            let highway_tag = get_tag("highway")
+                                .map(|s| s.to_string())
+                                .or_else(|| (leisure == "track").then(|| "track".to_string()));
+                            if let Some(h) = highway_tag {
                                 if !is_motorized(&h) && refs.len() >= 2 {
                                     let oneway = tags.iter().any(|(k, v)| {
                                         k == "oneway" && matches!(v.as_str(), "yes" | "true" | "1")
