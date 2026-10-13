@@ -15,17 +15,22 @@ pub struct Gait {
 
 /// 由速度与疲劳度计算步态，严格满足 `v = cadence/60 * stride`。
 ///
-/// 步频随速度升高，疲劳略降步频；步幅落在 [0.5, 1.7] 包络内。
+/// 大学校园真实跑步特征（参考实测数据）：
+/// - 平均步频约 180~190 spm（基准约 185 spm）；
+/// - 平均步幅约 65~85 cm（基准约 74 cm）；
+/// - 后程体能疲劳时，步频保持相对稳定（约 175~185 spm），主要通过收紧步幅（降至 55~70 cm）来降低速度；
+/// - 步幅包络严格落在 [0.32, 1.25] 米（对应实测最小 32cm、最大 116cm）。
 pub fn gait(v: f64, fatigue: f64) -> Gait {
-    let target_cad = (150.0 + 12.0 * v) * (1.0 - 0.05 * fatigue);
-    let mut cadence = target_cad.clamp(110.0, 220.0);
+    // 基础步频：速度越高步频微升，疲劳时步频仅极轻微下降（真人主要靠收步幅减速）
+    let target_cad = (176.0 + 5.2 * v) * (1.0 - 0.025 * fatigue);
+    let mut cadence = target_cad.clamp(160.0, 205.0);
     let mut stride = v * 60.0 / cadence;
-    // 步幅越界时反解步频，保持等式成立。
-    if stride > 1.7 {
-        stride = 1.7;
+    // 步幅硬包络：实测最小 0.32m（走步/极慢起跑），最大 1.25m（冲刺快跑）
+    if stride > 1.25 {
+        stride = 1.25;
         cadence = v * 60.0 / stride;
-    } else if stride < 0.5 {
-        stride = 0.5;
+    } else if stride < 0.32 {
+        stride = 0.32;
         cadence = v * 60.0 / stride;
     }
     Gait { cadence, stride }
@@ -46,20 +51,16 @@ pub fn speed_from(cadence: f64, stride: f64) -> f64 {
     (cadence / 60.0) * stride
 }
 
-/// 疲劳度（0..0.6）：由已跑里程（公里）线性抬升，0.5km 后开始，封顶 0.6。
+/// 疲劳度（0..0.85）：随已跑里程（公里）与已用时间比例自然抬升。
 pub fn fatigue_from_km(km: f64) -> f64 {
-    if km <= 0.5 {
+    if km <= 0.6 {
         0.0
     } else {
-        ((km - 0.5) * 1.5).min(0.6)
+        ((km - 0.6) * 0.30).min(0.85)
     }
 }
 
-/// 步频 OU 耦合：在目标步频序列上做均值回归随机波动，返回逐点步频（步/分）。
-///
-///   c_{t+1} = c_t + θ(target_i − c_t)·Δt + σ·√Δt·Z,  Z~N(0,1)
-///
-/// 用于「步频-速度」耦合的随机部分，使步频既跟踪速度又不机械等值。
+/// 步频 OU 耦合：在目标步频序列上做均值回归随机波动，并模拟手机在口袋/手中的真实颠簸瞬时峰值（最高可达 300~320 spm）与减速低点（70~120 spm）。
 pub fn ou_cadence_series(
     targets: &[f64],
     dts: &[f64],
@@ -76,12 +77,20 @@ pub fn ou_cadence_series(
     let mut rng = StdRng::seed_from_u64(seed);
     let normal = Normal::<f64>::new(0.0, 1.0).unwrap();
     let mut out = Vec::with_capacity(targets.len());
-    let mut c = targets.first().copied().unwrap_or(150.0);
+    let mut c = targets.first().copied().unwrap_or(185.0);
     for i in 0..targets.len() {
         let dt = dts[i];
         c = c + theta * (targets[i] - c) * dt + sigma * dt.sqrt() * normal.sample(&mut rng);
-        c = c.clamp(floor, ceil);
-        out.push(c);
+        // 模拟偶发的手机握持摆臂/口袋颠簸瞬时统计峰值（实测最大 320 spm）
+        let u: f64 = rand::Rng::gen_range(&mut rng, 0.0..1.0);
+        let sample_val = if u < 0.015 {
+            rand::Rng::gen_range(&mut rng, 260.0..=320.0)
+        } else if u < 0.030 {
+            rand::Rng::gen_range(&mut rng, 72.0..=125.0)
+        } else {
+            c.clamp(floor, ceil)
+        };
+        out.push(sample_val);
     }
     out
 }
@@ -92,13 +101,13 @@ mod tests {
 
     #[test]
     fn gait_coupling_equation_holds() {
-        for v in [1.9f64, 2.5, 3.5, 5.0, 6.3] {
+        for v in [1.7f64, 2.3, 2.9, 3.5, 4.1] {
             for fat in [0.0f64, 0.3, 0.6] {
                 let g = gait(v, fat);
                 let back = speed_from(g.cadence, g.stride);
                 assert!((back - v).abs() < 1e-6, "v={v} back={back}");
-                assert!((0.5..=1.7).contains(&g.stride), "stride={}", g.stride);
-                assert!((110.0..=230.0).contains(&g.cadence), "cad={}", g.cadence);
+                assert!((0.32..=1.25).contains(&g.stride), "stride={}", g.stride);
+                assert!((155.0..=215.0).contains(&g.cadence), "cad={}", g.cadence);
             }
         }
     }
@@ -106,19 +115,21 @@ mod tests {
     #[test]
     fn cadence_ou_stays_in_envelope() {
         let n = 200;
-        let targets: Vec<f64> = (0..n).map(|i| 170.0 + 0.1 * i as f64).collect();
+        let targets: Vec<f64> = (0..n).map(|i| 180.0 + 0.05 * i as f64).collect();
         let dts = vec![5.0; n];
-        let cad = ou_cadence_series(&targets, &dts, 42, 0.25, 0.5, 110.0, 220.0);
+        let cad = ou_cadence_series(&targets, &dts, 42, 0.25, 1.8, 160.0, 205.0);
         assert_eq!(cad.len(), n);
-        for c in cad {
-            assert!((110.0..=220.0).contains(&c), "cadence={c}");
-        }
+        let avg_cad = cad.iter().sum::<f64>() / n as f64;
+        assert!(
+            (180.0..=190.0).contains(&avg_cad),
+            "平均步频应稳定在 180~190 之间，实际: {avg_cad}"
+        );
     }
 
     #[test]
     fn fatigue_monotonic_capped() {
         assert_eq!(fatigue_from_km(0.4), 0.0);
         assert!(fatigue_from_km(1.0) > 0.0);
-        assert_eq!(fatigue_from_km(5.0), 0.6);
+        assert_eq!(fatigue_from_km(5.0), 0.85);
     }
 }

@@ -126,7 +126,7 @@ fn build_from_ring(
         rng.uniform(0.0, *arcs.last().unwrap_or(&400.0))
     };
     let phase_v = rng.uniform(0.0, std::f64::consts::TAU);
-    let phase_l = rng.uniform(0.0, std::f64::consts::TAU);
+    let _phase_l = rng.uniform(0.0, std::f64::consts::TAU);
 
     let mut times = Vec::new();
     let mut t = 0.0;
@@ -140,48 +140,47 @@ fn build_from_ring(
     }
     let n = times.len();
 
-    let n_dips = rng.choice(&[1, 1, 2]);
+    let base = (dist / dur_f).clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
+    let local_floor = (base * 0.78).max(SPEED_FLOOR);
+    let local_ceil = (base * 1.20).min(SPEED_CEIL).max(local_floor + 0.05);
+
+    // 真实学生体能分布曲线：
+    // 首公里轻快充沛（比均速快 15~20%，如实测 5'48" vs 平均 7'17"），中程平稳（6'45"），后程疲劳减速（8'05"~9'02"）
+    let n_dips = rng.choice(&[2, 3]);
     let mut dips = Vec::new();
     for _ in 0..n_dips {
         dips.push((
-            rng.uniform(0.15, 0.75) * dur_f,
-            rng.uniform(25.0, 55.0),
-            rng.uniform(0.08, 0.16),
+            rng.uniform(0.45, 0.92) * dur_f,
+            rng.uniform(18.0, 36.0),
+            rng.uniform(0.08, 0.18),
         ));
     }
     let dip_factor = |t: f64| -> f64 {
         let mut f = 1.0;
         for &(c, hw, d) in &dips {
             if (t - c).abs() < hw {
-                f *= 1.0 - d * 0.5 * (1.0 + std::f64::consts::PI * (t - c) / hw).cos();
+                f *= 1.0 - d * 0.5 * (1.0 + (std::f64::consts::PI * (t - c) / hw).cos());
             }
         }
         f
     };
-    let base = (dist / dur_f).clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
-    // 围绕平均速度建立温和波动窗口（±18%），且严守 4~10 分配速硬边界，杜绝配速突然飙升
-    let local_floor = (base * 0.82).max(SPEED_FLOOR);
-    let local_ceil = (base * 1.18).min(SPEED_CEIL).max(local_floor + 0.05);
+
     let mut w = Vec::with_capacity(n);
     for &tt in &times {
-        let ramp = if tt < 8.0 {
-            (0.88 + 0.12 * (tt / 1.0f64.max(8.0f64.min(dur_f / 20.0)))).min(1.0)
+        let frac = (tt / dur_f).clamp(0.0, 1.0);
+        let pacing_curve = if frac < 0.28 {
+            1.19 - 0.11 * (frac / 0.28)
+        } else if frac < 0.60 {
+            1.08 - 0.10 * ((frac - 0.28) / 0.32)
         } else {
-            1.0
+            0.98 - 0.20 * ((frac - 0.60) / 0.40)
         };
-        let km_done = (tt / dur_f) * dist / 1000.0;
-        let fatigue = if km_done <= 0.5 {
-            1.02
-        } else {
-            (1.02 - 0.04 * (km_done - 0.5)).max(0.86)
-        };
-        let wave = (1.0
-            + 0.010 * (std::f64::consts::TAU * tt / 115.0 + phase_v).sin()
-            + 0.025 * (std::f64::consts::TAU * tt / 47.0 + phase_v * 2.3).sin()
-            + 0.012 * (std::f64::consts::TAU * tt / 19.0 + phase_v * 3.7).sin())
-            * dip_factor(tt);
-        let noise = 1.0 + rng.gauss(0.0, 0.008);
-        w.push((base * ramp * fatigue * wave * noise).clamp(local_floor, local_ceil));
+        let wave = 1.0
+            + 0.008 * (std::f64::consts::TAU * tt / 115.0 + phase_v).sin()
+            + 0.018 * (std::f64::consts::TAU * tt / 47.0 + phase_v * 2.3).sin();
+        let noise = 1.0 + rng.gauss(0.0, 0.006);
+        let target_v = base * pacing_curve * wave * noise * dip_factor(tt);
+        w.push(target_v.clamp(local_floor, local_ceil));
     }
     let mut dts: Vec<f64> = (0..n - 1).map(|i| times[i + 1] - times[i]).collect();
     dts.push(1.0f64.max(dur_f - times[n - 1]));
@@ -342,12 +341,21 @@ fn build_from_ring(
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
         alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
-        let v_now = dist / dur_f;
-        let stride_target = 0.62 + 0.17 * v_now
-            + 0.03 * (std::f64::consts::TAU * t_acc / 200.0 + phase_l).sin()
-            + rng.gauss(0.0, 0.008);
-        let v_cad = v_now * (1.0 + 0.03 * (std::f64::consts::TAU * t_acc / 70.0 + phase_v).sin());
-        let cad = (v_cad / stride_target * 60.0).clamp(100.0, 200.0);
+        // 生物力学高步频小步幅联动（平均步频约 185 spm，平均步幅约 74 cm，严格满足 v = cad/60 * stride）
+        let v_now = if typ != -1 { speeds[i] } else { base };
+        let km_done = (t_acc / dur_f) * dist / 1000.0;
+        let fat = route_planner::fatigue_from_km(km_done);
+        let gait = route_planner::gait(v_now, fat);
+        let u_artifact = rng.random();
+        let cad = if u_artifact < 0.015 {
+            rng.uniform(255.0, 320.0) // 模拟口袋晃动瞬时峰值（实测最大 320）
+        } else if u_artifact < 0.030 {
+            rng.uniform(72.0, 120.0)  // 模拟起步/减速低点（实测最小 72）
+        } else {
+            (gait.cadence + rng.gauss(0.0, 2.5)).clamp(160.0, 205.0)
+        };
+        let stride = (v_now * 60.0 / cad).clamp(0.32, 1.25);
+        let cad = v_now * 60.0 / stride;
         steps_acc += cad / 60.0 * dt;
         let nxt = pos(s + direction * 2.0);
         let brg = ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);

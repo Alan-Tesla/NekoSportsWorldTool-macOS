@@ -769,7 +769,7 @@ fn build_track_from_route(
         30.0,
     );
 
-    // 生物力学：步频在目标值附近 OU 波动，步幅反解严格满足 v=(cad/60)·stride
+    // 生物力学：高步频（180~190 spm）小步幅（65~85 cm）耦合，严格满足 v=(cad/60)·stride
     let targets: Vec<f64> = (0..n)
         .map(|i| {
             let km_done = (times[i] / dur_f) * dist / 1000.0;
@@ -777,7 +777,7 @@ fn build_track_from_route(
         })
         .collect();
     let cadence_seed = seed.wrapping_add(0xC6A4_A793_5BD1_E995);
-    let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.25, 0.5, 110.0, 220.0);
+    let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.25, 2.0, 160.0, 205.0);
 
     // GPS 抖动：AR(1) 相关漂移 + 高斯测量噪声（SDF 逐点放大）
     let mut jitter = GpsJitter::new(0.72, 0.75, 0.3);
@@ -918,14 +918,9 @@ fn build_track_from_route(
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
         alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
-        // 生物力学联动：v=(cad/60)·stride
+        // 生物力学联动：v=(cad/60)·stride，平均步幅约 74cm，平均步频约 185spm
         let v_now = speeds[i];
-        let mut stride = v_now * 60.0 / cadences[i];
-        if stride > 1.7 {
-            stride = 1.7;
-        } else if stride < 0.5 {
-            stride = 0.5;
-        }
+        let stride = (v_now * 60.0 / cadences[i]).clamp(0.32, 1.25);
         let cad = v_now * 60.0 / stride;
         steps_acc += cad / 60.0 * dt;
         let nxt = pos(s + 2.0);
