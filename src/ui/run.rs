@@ -957,9 +957,31 @@ impl App {
             }
         }
 
+        let (passed_cp_cnt, total_cp_cnt, missing_cps) = if let Some(p) = &self.run_page.preview {
+            let total = p.checkpoints.len();
+            let mut passed = 0usize;
+            let mut missing = Vec::new();
+            for &(cla, clo) in &p.checkpoints {
+                let hit = p.route.iter().any(|&(rla, rlo)| {
+                    let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
+                    let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
+                    dx.hypot(dy) <= 20.0
+                });
+                if hit {
+                    passed += 1;
+                } else {
+                    missing.push((cla, clo));
+                }
+            }
+            (passed, total, missing)
+        } else {
+            (0, 0, Vec::new())
+        };
+
         if self.run_page.preview.is_some() {
             let mut tile_source = TileSource::from_str(&self.config.tile_source);
             let prev_tile = tile_source;
+            let mut do_complete_cps = false;
             mobile::row(ui, |ui| {
                 ui.label("底图：");
                 egui::ComboBox::from_id_salt("run_tile_source")
@@ -975,13 +997,41 @@ impl App {
                         }
                     });
                 ui.checkbox(&mut self.osm_page.show_road_overlay, "路网");
+                if total_cp_cnt > 0 {
+                    ui.separator();
+                    if passed_cp_cnt >= total_cp_cnt {
+                        ui.colored_label(
+                            theme::ok(),
+                            format!("打卡点：已覆盖 {}/{} 个 √", passed_cp_cnt, total_cp_cnt),
+                        );
+                    } else {
+                        ui.colored_label(
+                            theme::warn(),
+                            format!(
+                                "打卡点：已覆盖 {}/{} 个 ⚠（缺 {} 个）",
+                                passed_cp_cnt,
+                                total_cp_cnt,
+                                total_cp_cnt - passed_cp_cnt
+                            ),
+                        );
+                        if is_custom
+                            && ui
+                                .small_button("＋一键补齐")
+                                .on_hover_text("自动将尚未经过的打卡点插入路线末尾前，确保全部打卡达标")
+                                .clicked()
+                        {
+                            do_complete_cps = true;
+                        }
+                    }
+                }
                 super::map::legend(
                     ui,
                     &[
                         ("可跑路网", egui::Color32::from_rgb(16, 135, 115)),
                         ("围栏", egui::Color32::from_rgb(180, 118, 0)),
+                        ("已途经打卡点(绿√)", egui::Color32::from_rgb(16, 185, 129)),
+                        ("未途经打卡点(橙标)", egui::Color32::from_rgb(245, 158, 11)),
                         ("路线", egui::Color32::from_rgb(30, 111, 216)),
-                        ("打卡点", egui::Color32::from_rgb(240, 180, 0)),
                         ("起点", egui::Color32::from_rgb(22, 160, 90)),
                         ("末点", egui::Color32::from_rgb(220, 38, 38)),
                     ],
@@ -990,6 +1040,17 @@ impl App {
                     self.run_page.map_fitted = false;
                 }
             });
+            if do_complete_cps && !missing_cps.is_empty() {
+                if self.config.custom_waypoints.len() >= 2 {
+                    let last = self.config.custom_waypoints.pop().unwrap();
+                    self.config.custom_waypoints.extend(missing_cps);
+                    self.config.custom_waypoints.push(last);
+                } else {
+                    self.config.custom_waypoints.extend(missing_cps);
+                }
+                self.sync_custom_route_config();
+                self.status = "已自动补齐尚未途经的打卡点".into();
+            }
             if tile_source != prev_tile {
                 self.config.tile_source = tile_source.as_str().into();
                 let _ = crate::api::model::save_config(&self.config);
@@ -1059,30 +1120,10 @@ impl App {
                     .map
                     .draw_polygon(&clipped, canvas, f, fence_c, 2.0);
             }
-            let cp_pass = egui::Color32::from_rgb(16, 185, 129);
-            let cp_unpass = egui::Color32::from_rgb(240, 180, 0);
-            let mut passed_cp_count = 0usize;
-            for &(la, lo) in &p.checkpoints {
-                let hit = p.route.iter().any(|&(rla, rlo)| {
-                    let dx = (rla - la) * crate::track::geom::MET_PER_DEG_LAT;
-                    let dy = (rlo - lo) * crate::track::geom::MET_PER_DEG_LNG;
-                    dx * dx + dy * dy <= 16.0 * 16.0
-                });
-                if hit {
-                    passed_cp_count += 1;
-                }
-                let sp = self.run_page.map.to_screen(canvas, la, lo);
-                if canvas.contains(sp) {
-                    let c = if hit { cp_pass } else { cp_unpass };
-                    let r = if hit { 5.5 } else { 4.2 };
-                    clipped.circle_filled(sp, r, c);
-                    clipped.circle_stroke(
-                        sp,
-                        r,
-                        egui::Stroke::new(1.3_f32, egui::Color32::WHITE),
-                    );
-                }
-            }
+            // 学校打卡点（已途经绿底带「√」标 / 未途经橙底带编号，悬停显示剩余米数）
+            self.run_page
+                .map
+                .draw_checkpoints(&painter, canvas, &p.checkpoints, &p.route);
             let route_c = egui::Color32::from_rgb(30, 111, 216);
             if p.route.len() >= 2 {
                 self.run_page
@@ -1131,7 +1172,7 @@ impl App {
                         "本次方案 {:.2} km · 开环总长 {:.0} m · 已途经打卡点 {}/{} · {} 途经点",
                         plan.dist,
                         p.length_m,
-                        passed_cp_count,
+                        passed_cp_cnt,
                         p.checkpoints.len(),
                         self.config.custom_waypoints.len(),
                     )
@@ -1143,7 +1184,7 @@ impl App {
                             plan.dist,
                             p.length_m,
                             loops,
-                            passed_cp_count,
+                            passed_cp_cnt,
                             p.checkpoints.len(),
                             if is_custom {
                                 format!(" · {} 途经点", self.config.custom_waypoints.len())
@@ -1156,7 +1197,7 @@ impl App {
                             "本次方案 {:.2} km · 路线 {:.0} m · 已途经打卡点 {}/{}{}",
                             plan.dist,
                             p.length_m,
-                            passed_cp_count,
+                            passed_cp_cnt,
                             p.checkpoints.len(),
                             if is_custom {
                                 format!(" · {} 途经点", self.config.custom_waypoints.len())
@@ -1233,12 +1274,11 @@ impl App {
     fn start_run(&mut self) {
         // 参数变更时补齐方案；提交直接使用预计算值
         self.run_page.ensure_plan();
-        let page = &mut self.run_page;
-        let plan = match page.plan.clone() {
+        let plan = match self.run_page.plan.clone() {
             Some(p) => p,
             None => return,
         };
-        let altitude_spec = match crate::track::altitude::parse_spec(&page.manual_altitude) {
+        let altitude_spec = match crate::track::altitude::parse_spec(&self.run_page.manual_altitude) {
             Ok(spec) => spec,
             Err(e) => {
                 self.status = e;
@@ -1250,15 +1290,57 @@ impl App {
             Some(crate::track::altitude::AltitudeSpec::Single(value)) => (Some(value), None),
             Some(crate::track::altitude::AltitudeSpec::Range(range)) => (None, Some(range)),
         };
-        let (dist, dur) = (plan.dist * 1000.0, plan.dur); // 米
+        let dist_m = plan.dist * 1000.0;
+        let dur = plan.dur;
         let start_ms = plan.start_ms;
-        let face_check = if page.face_check { 1 } else { 0 };
-        let route_mode = page.route_mode;
-        self.config.dist_min = page.dist_min;
-        self.config.dist_max = page.dist_max;
-        self.config.pace_min = page.pace_min;
-        self.config.pace_max = page.pace_max;
-        self.config.face_check = page.face_check;
+        let face_check = if self.run_page.face_check { 1 } else { 0 };
+        let route_mode = self.run_page.route_mode;
+
+        // 自定义规划模式防漏打卡点拦截保护：检查是否所有打卡点都已覆盖
+        if route_mode == RouteMode::Custom {
+            let (pts_bd, _) = self.cached_points_and_fences();
+            let total_cp = pts_bd.len();
+            if total_cp >= 2 {
+                let route_pts = self
+                    .run_page
+                    .preview
+                    .as_ref()
+                    .map(|p| p.route.clone())
+                    .unwrap_or_default();
+                let passed_cnt = pts_bd
+                    .iter()
+                    .filter(|&&(cla, clo)| {
+                        route_pts.iter().any(|&(rla, rlo)| {
+                            let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
+                            let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
+                            dx.hypot(dy) <= 20.0
+                        })
+                    })
+                    .count();
+                if passed_cnt < total_cp {
+                    self.popup = Some(super::PopupInfo {
+                        title: "⚠ 打卡点未全部覆盖警告（未达标风险）".into(),
+                        lines: vec![
+                            format!(
+                                "当前规划路线仅经过了 {}/{} 个打卡点，尚有 {} 个打卡点未覆盖！",
+                                passed_cnt,
+                                total_cp,
+                                total_cp - passed_cnt
+                            ),
+                            "按运动世界校园规则，打卡点数量不足会被服务器直接判定为「未达标」。".into(),
+                            "建议：返回地图点击「＋一键补齐」，或手动微调途经点经过金色打卡点后再开始跑步。".into(),
+                        ],
+                    });
+                    return;
+                }
+            }
+        }
+
+        self.config.dist_min = self.run_page.dist_min;
+        self.config.dist_max = self.run_page.dist_max;
+        self.config.pace_min = self.run_page.pace_min;
+        self.config.pace_max = self.run_page.pace_max;
+        self.config.face_check = self.run_page.face_check;
         self.config.manual_altitude = manual_altitude;
         self.config.manual_altitude_range = manual_altitude_range;
         self.config.route_mode = route_mode.as_str().into();
@@ -1279,7 +1361,7 @@ impl App {
             let mut log = App::logger(tx.clone());
             let mut client = crate::api::client::ApiClient::new(identity, Some(session));
             let params = crate::api::flow::RunParams {
-                dist,
+                dist: dist_m,
                 dur,
                 start_ms,
                 face_check,

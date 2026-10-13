@@ -478,8 +478,31 @@ impl App {
             self.osm_page.preview = Some(plan);
         }
 
+        // 统计打卡点实际覆盖情况
+        let (passed_cp_cnt, total_cp_cnt, missing_cps) = if let Some(p) = &self.osm_page.preview {
+            let total = p.checkpoints.len();
+            let mut passed = 0usize;
+            let mut missing = Vec::new();
+            for &(cla, clo) in &p.checkpoints {
+                let hit = p.route.iter().any(|&(rla, rlo)| {
+                    let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
+                    let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
+                    dx.hypot(dy) <= 20.0
+                });
+                if hit {
+                    passed += 1;
+                } else {
+                    missing.push((cla, clo));
+                }
+            }
+            (passed, total, missing)
+        } else {
+            (0, 0, Vec::new())
+        };
+
         // ── 统计与图例栏 ─────────────────────────────────────────────
         ui.add_space(2.0);
+        let mut do_complete_cps = false;
         ui.horizontal_wrapped(|ui| {
             if let Some(net) = &self.network {
                 ui.label(format!(
@@ -490,12 +513,34 @@ impl App {
                 ));
                 ui.separator();
             }
-            ui.label(format!(
-                "打卡点：{} · 围栏：{} · 途经点：{}",
-                pts_bd.len(),
-                fences.len(),
-                self.config.custom_waypoints.len()
-            ));
+            if total_cp_cnt > 0 {
+                if passed_cp_cnt >= total_cp_cnt {
+                    ui.colored_label(
+                        theme::ok(),
+                        format!("打卡点：已覆盖 {}/{} 个 √（全部达标）", passed_cp_cnt, total_cp_cnt),
+                    );
+                } else {
+                    ui.colored_label(
+                        theme::warn(),
+                        format!(
+                            "打卡点：已覆盖 {}/{} 个 ⚠（缺 {} 个可能未达标）",
+                            passed_cp_cnt,
+                            total_cp_cnt,
+                            total_cp_cnt - passed_cp_cnt
+                        ),
+                    );
+                    if ui
+                        .small_button("＋一键补齐未途经点")
+                        .on_hover_text("自动将尚未经过的打卡点插入路线末尾前，确保全部打卡达标")
+                        .clicked()
+                    {
+                        do_complete_cps = true;
+                    }
+                }
+                ui.separator();
+            } else {
+                ui.label(format!("围栏：{} · 途经点：{}", fences.len(), self.config.custom_waypoints.len()));
+            }
             if let Some(p) = &self.osm_page.preview {
                 if p.length_m > 0.0 {
                     ui.separator();
@@ -547,6 +592,17 @@ impl App {
             self.sync_custom_route_config();
             self.status = format!("已将跑步目标距离同步为 {:.2}~{:.2} km", lo, hi);
         }
+        if do_complete_cps && !missing_cps.is_empty() {
+            if self.config.custom_waypoints.len() >= 2 {
+                let last = self.config.custom_waypoints.pop().unwrap();
+                self.config.custom_waypoints.extend(missing_cps);
+                self.config.custom_waypoints.push(last);
+            } else {
+                self.config.custom_waypoints.extend(missing_cps);
+            }
+            self.sync_custom_route_config();
+            self.status = "已自动补齐尚未途经的打卡点".into();
+        }
 
         super::map::legend(
             ui,
@@ -555,7 +611,8 @@ impl App {
                 ("操场跑道", egui::Color32::from_rgb(116, 186, 132)),
                 ("建筑", egui::Color32::from_rgb(214, 182, 158)),
                 ("电子围栏", egui::Color32::from_rgb(180, 118, 0)),
-                ("打卡点", egui::Color32::from_rgb(240, 180, 0)),
+                ("已途经打卡点(绿√)", egui::Color32::from_rgb(16, 185, 129)),
+                ("未途经打卡点(橙标)", egui::Color32::from_rgb(245, 158, 11)),
                 ("规划路线", egui::Color32::from_rgb(30, 111, 216)),
                 ("起点(起)", egui::Color32::from_rgb(22, 160, 90)),
                 ("途经点", egui::Color32::from_rgb(30, 111, 216)),
@@ -630,27 +687,11 @@ impl App {
                     .map
                     .draw_polygon(&clipped, canvas, f, fence_color, 2.2);
             }
-            // 学校打卡点（已途经亮绿 / 未途经金色圆点 + 白边）
-            let cp_pass = egui::Color32::from_rgb(16, 185, 129);
-            let cp_unpass = egui::Color32::from_rgb(240, 180, 0);
-            for &(la, lo) in &p.checkpoints {
-                let hit = p.route.iter().any(|&(rla, rlo)| {
-                    let dx = (rla - la) * crate::track::geom::MET_PER_DEG_LAT;
-                    let dy = (rlo - lo) * crate::track::geom::MET_PER_DEG_LNG;
-                    dx * dx + dy * dy <= 16.0 * 16.0
-                });
-                let sp = self.osm_page.map.to_screen(canvas, la, lo);
-                if canvas.contains(sp) {
-                    let c = if hit { cp_pass } else { cp_unpass };
-                    let r = if hit { 5.8 } else { 4.6 };
-                    clipped.circle_filled(sp, r, c);
-                    clipped.circle_stroke(
-                        sp,
-                        r,
-                        egui::Stroke::new(1.4_f32, egui::Color32::WHITE),
-                    );
-                }
-            }
+            // 学校打卡点（已途经绿底带「√」标 / 未途经橙底带编号，悬停显示剩余米数）
+            self.osm_page
+                .map
+                .draw_checkpoints(&painter, canvas, &p.checkpoints, &p.route);
+
             // 规划路线（带方向箭头）
             if p.route.len() >= 2 {
                 let route_color = if p.length_m > 0.0 {

@@ -1055,6 +1055,110 @@ impl MapState {
         }
     }
 
+    /// 绘制打卡点并计算实际经过情况：
+    /// - 路线 20m 内经过的打卡点：绿色实心圆 + 白色对勾「√」；
+    /// - 未经过的打卡点：亮橙色实心圆 + 序号标，鼠标悬停显示距路线差多少米；
+    /// 返回 `(passed_count, total_count, passed_flags)`。
+    pub fn draw_checkpoints(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        checkpoints: &[(f64, f64)],
+        route: &[(f64, f64)],
+    ) -> (usize, usize, Vec<bool>) {
+        let clipped = painter.with_clip_rect(rect);
+        let total = checkpoints.len();
+        let mut passed_flags = Vec::with_capacity(total);
+        let mut passed_count = 0usize;
+        let hover_pos = self
+            .hover_coord
+            .map(|(lat, lon)| self.to_screen(rect, lat, lon));
+
+        for (i, &(cla, clo)) in checkpoints.iter().enumerate() {
+            let min_d_m = route
+                .iter()
+                .map(|&(rla, rlo)| {
+                    let dy = (rla - cla) * MET_PER_DEG_LAT;
+                    let dx = (rlo - clo) * MET_PER_DEG_LNG;
+                    dx.hypot(dy)
+                })
+                .fold(f64::INFINITY, f64::min);
+            let is_pass = min_d_m <= 20.0;
+            if is_pass {
+                passed_count += 1;
+            }
+            passed_flags.push(is_pass);
+
+            let pos = self.to_screen(rect, cla, clo);
+            if !rect.expand(20.0).contains(pos) {
+                continue;
+            }
+            let is_hover = hover_pos.map_or(false, |p| p.distance(pos) <= 15.0);
+            let fill = if is_pass {
+                Color32::from_rgb(16, 185, 129)
+            } else {
+                Color32::from_rgb(245, 158, 11)
+            };
+            let radius = if is_hover { 7.5 } else { 6.0 };
+            if !is_pass || is_hover {
+                clipped.circle_stroke(
+                    pos,
+                    radius + 3.0,
+                    Stroke::new(
+                        1.5_f32,
+                        Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 120),
+                    ),
+                );
+            }
+            clipped.circle_filled(pos, radius, fill);
+            clipped.circle_stroke(pos, radius, Stroke::new(1.4_f32, Color32::WHITE));
+            let text = if is_pass {
+                "√".to_string()
+            } else {
+                format!("{}", i + 1)
+            };
+            clipped.text(
+                pos,
+                Align2::CENTER_CENTER,
+                text,
+                FontId::proportional(9.5),
+                Color32::WHITE,
+            );
+
+            if is_hover {
+                let tip = if is_pass {
+                    format!("打卡点 #{}: 已途经 (距路线 {:.1}m) √", i + 1, min_d_m)
+                } else if min_d_m.is_finite() {
+                    format!("打卡点 #{}: 未途经 (还差 {:.0}m) ⚠", i + 1, min_d_m)
+                } else {
+                    format!("打卡点 #{}: 未途经 ⚠", i + 1)
+                };
+                let tip_bg = if is_pass {
+                    Color32::from_rgb(6, 95, 70)
+                } else {
+                    Color32::from_rgb(146, 64, 14)
+                };
+                let tip_pos = Pos2::new(pos.x, pos.y - 18.0);
+                clipped.rect_filled(
+                    Rect::from_center_size(
+                        tip_pos,
+                        Vec2::new(tip.chars().count() as f32 * 11.0 + 8.0, 16.0),
+                    ),
+                    egui::Rounding::same(3.0),
+                    tip_bg,
+                );
+                clipped.text(
+                    tip_pos,
+                    Align2::CENTER_CENTER,
+                    tip,
+                    FontId::proportional(10.5),
+                    Color32::WHITE,
+                );
+            }
+        }
+        (passed_count, total, passed_flags)
+    }
+
     /// 绘制带序号、起终点及自定义特殊标记（如「入」「出」）的途经点徽章。
     pub fn draw_waypoints_ext(
         &self,
