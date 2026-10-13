@@ -13,25 +13,30 @@ use super::geom::{
 use super::model::{GenPoint, Segment, TenWindow, Track};
 use super::postfix::apply_post_fixes;
 
-/// 有效配速窗口（判定规则 2'21"-10'00"/km ≈ 1.667-7.092 m/s），硬边界留余量。
-pub const SPEED_FLOOR: f64 = 1.90;
-pub const SPEED_CEIL: f64 = 6.30;
+/// 有效配速窗口：4'00"-10'00"/km（即 240-600 秒/km ≈ 1.667-4.167 m/s），留安全余量（约 4'04"-9'41"/km）。
+pub const SPEED_FLOOR: f64 = 1.72;
+pub const SPEED_CEIL: f64 = 4.10;
 
-/// 等比缩放逐点速度至目标总距：越界点钳在窗口边界，剩余差量由未饱和点分摊（迭代收敛）。
-/// 与整体等比缩放的区别：任何一点的瞬时配速都不会越出有效窗口。
-fn fit_speeds(w: &mut [f64], dts: &[f64], target: f64) {
-    for _ in 0..24 {
+/// 等比缩放逐点速度至目标总距：越界点钳在 `[floor, ceil]` 边界，剩余差量由未饱和点分摊（迭代收敛）。
+pub fn fit_speeds_bounded(w: &mut [f64], dts: &[f64], target: f64, floor: f64, ceil: f64) {
+    let floor = floor.clamp(SPEED_FLOOR, SPEED_CEIL);
+    let ceil = ceil.clamp(floor, SPEED_CEIL);
+    for _ in 0..32 {
         let cur: f64 = w.iter().zip(dts).map(|(x, dt)| x * dt).sum();
-        if (cur - target).abs() <= 1.0 {
+        if (cur - target).abs() <= 0.5 || cur <= 1e-9 {
             break;
         }
         let k = target / cur;
         for x in w.iter_mut() {
-            *x = (*x * k).clamp(SPEED_FLOOR, SPEED_CEIL);
+            if *x > 0.0 {
+                *x = (*x * k).clamp(floor, ceil);
+            }
         }
     }
     for x in w.iter_mut() {
-        *x = x.clamp(SPEED_FLOOR, SPEED_CEIL);
+        if *x > 0.0 {
+            *x = x.clamp(floor, ceil);
+        }
     }
 }
 
@@ -120,12 +125,6 @@ fn build_from_ring(
     } else {
         rng.uniform(0.0, *arcs.last().unwrap_or(&400.0))
     };
-    let total_arc = (*arcs.last().unwrap_or(&dist)).max(1.0);
-    let arc_scale = if !closed && dist > 1.0 {
-        total_arc / dist
-    } else {
-        1.0
-    };
     let phase_v = rng.uniform(0.0, std::f64::consts::TAU);
     let phase_l = rng.uniform(0.0, std::f64::consts::TAU);
 
@@ -159,35 +158,41 @@ fn build_from_ring(
         }
         f
     };
-    let base = dist / dur_f;
+    let base = (dist / dur_f).clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
+    // 围绕平均速度建立温和波动窗口（±18%），且严守 4~10 分配速硬边界，杜绝配速突然飙升
+    let local_floor = (base * 0.82).max(SPEED_FLOOR);
+    let local_ceil = (base * 1.18).min(SPEED_CEIL).max(local_floor + 0.05);
     let mut w = Vec::with_capacity(n);
     for &tt in &times {
         let ramp = if tt < 8.0 {
-            (0.85 + 0.15 * (tt / 1.0f64.max(8.0f64.min(dur_f / 20.0)))).min(1.0)
-        } else {
-            1.0
-        } * if tt > dur_f - 8.0 {
-            1.0 + 0.03 * (tt - (dur_f - 8.0)) / 8.0
+            (0.88 + 0.12 * (tt / 1.0f64.max(8.0f64.min(dur_f / 20.0)))).min(1.0)
         } else {
             1.0
         };
         let km_done = (tt / dur_f) * dist / 1000.0;
-        let fatigue = if km_done <= 0.5 { 1.03 } else { (1.03 - 0.06 * (km_done - 0.5)).max(0.80) };
-        let wave = (1.0 + 0.010 * (std::f64::consts::TAU * tt / 115.0 + phase_v).sin()
-            + 0.035 * (std::f64::consts::TAU * tt / 47.0 + phase_v * 2.3).sin()
-            + 0.015 * (std::f64::consts::TAU * tt / 19.0 + phase_v * 3.7).sin())
+        let fatigue = if km_done <= 0.5 {
+            1.02
+        } else {
+            (1.02 - 0.04 * (km_done - 0.5)).max(0.86)
+        };
+        let wave = (1.0
+            + 0.010 * (std::f64::consts::TAU * tt / 115.0 + phase_v).sin()
+            + 0.025 * (std::f64::consts::TAU * tt / 47.0 + phase_v * 2.3).sin()
+            + 0.012 * (std::f64::consts::TAU * tt / 19.0 + phase_v * 3.7).sin())
             * dip_factor(tt);
         let noise = 1.0 + rng.gauss(0.0, 0.008);
-        w.push(base * ramp * fatigue * wave * noise);
+        w.push((base * ramp * fatigue * wave * noise).clamp(local_floor, local_ceil));
     }
     let mut dts: Vec<f64> = (0..n - 1).map(|i| times[i + 1] - times[i]).collect();
     dts.push(1.0f64.max(dur_f - times[n - 1]));
-    // 逐点速度全部约束在有效配速窗口内，并精确命中目标距离
-    fit_speeds(&mut w, &dts, dist);
-    let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
-    let speeds: Vec<f64> = w.clone();
 
-    let tl_w = [((-1i64, 4i64), 54u32), ((-1, 1), 27), ((-1, 12), 13), ((-1, 5), 3), ((-1, 6), 2)];
+    let tl_w = [
+        ((-1i64, 4i64), 54u32),
+        ((-1, 1), 27),
+        ((-1, 12), 13),
+        ((-1, 5), 3),
+        ((-1, 6), 2),
+    ];
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
     for _ in 0..n {
         let u = rng.random();
@@ -212,14 +217,25 @@ fn build_from_ring(
             kinds[i] = (rng.choice(&[3, 0]), 1);
         }
     }
-    let normal_idx: Vec<usize> =
-        (0..n).filter(|&i| kinds[i].0 != -1 && i > 1).collect();
-    let share: f64 = normal_idx.iter().map(|&i| seg_dist[i]).sum();
-    let share = if share == 0.0 { 1.0 } else { share };
-    let mut disp_of = vec![0.0f64; n];
-    for &i in &normal_idx {
-        disp_of[i] = seg_dist[i] * (dist / share);
+
+    // 先将非正常移动点（哨兵 i<=1 及异常点 -1）的速度置 0，再直接在正常点上做带界速度拟合，
+    // 确保每个正常点的实际位移速度 d_step / dt 严格落在 4~10 分配速窗口内，不因分摊而被二次放大。
+    for i in 0..n {
+        if i <= 1 || kinds[i].0 == -1 {
+            w[i] = 0.0;
+        }
     }
+    fit_speeds_bounded(&mut w, &dts, dist, local_floor, local_ceil);
+    // 若温和窗口 [local_floor, local_ceil] 已饱和仍差少量距离，放宽到 [SPEED_FLOOR, SPEED_CEIL] 收敛
+    let cur_sum: f64 = w.iter().zip(&dts).map(|(x, dt)| x * dt).sum();
+    if (cur_sum - dist).abs() > 2.0 {
+        fit_speeds_bounded(&mut w, &dts, dist, SPEED_FLOOR, SPEED_CEIL);
+    }
+    let disp_of: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
+    let seg_dist: Vec<f64> = disp_of.clone();
+    let speeds: Vec<f64> = (0..n)
+        .map(|i| if w[i] > 0.0 { w[i] } else { base })
+        .collect();
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut s = s0;
@@ -245,7 +261,8 @@ fn build_from_ring(
             if closed {
                 ring_point_at(dense, arcs, ss)
             } else {
-                open_point_at(dense, arcs, ss * arc_scale)
+                // 1:1 真实米制步进，避免坐标被拉伸导致 GPS 实际移动配速失真
+                open_point_at(dense, arcs, ss)
             }
         };
         let mut d_step = 0.0f64;
@@ -337,21 +354,20 @@ fn build_from_ring(
         // 异常点（-1）：avgSpeed 为累计均值（真人与此一致，不为 0）；
         // GPS 瞬时速度多为低速，偶发 15-46 km/h 漂移尖峰
         let (avg_sp, gps_speed) = if typ == -1 {
-            let avg = round_to(dist_acc / t_acc.max(1.0), 4);
-            let gps = if rng.random() < 0.12 {
-                rng.uniform(15.0, 46.0)
-            } else {
-                rng.uniform(0.5, 6.0)
-            };
+            let avg = round_to((dist_acc / t_acc.max(1.0)).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
+            let gps = rng.uniform(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6);
             (avg, round_to(gps, 4))
         } else {
-            let avg = round_to(d_step / dt, 4);
+            let avg = round_to((d_step / dt).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
             let kmh = avg * 3.6;
-            let sigma = (kmh * 0.08).max(0.05);
+            let sigma = (kmh * 0.06).max(0.05);
             let gps = if rng.random() < 0.20 {
                 0.0
             } else {
-                round_to((kmh + rng.gauss(0.0, sigma)).max(0.0), 4)
+                round_to(
+                    (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
+                    4,
+                )
             };
             (avg, gps)
         };
@@ -437,7 +453,9 @@ fn build_from_ring(
 
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
-    // 点位吸附：<40m 精确落位
+    // 点位吸附：经典模式 <40m 吸附；自定义规划模式（pin_start=true）仅在 <=15m 时吸附，
+    // 防止把用户未经过、距离路线二三十米外的打卡点强行拉过来算作已打卡。
+    let snap_limit = if pin_start { 15.0 * 15.0 } else { 40.0 * 40.0 };
     for pl in points_bd {
         let mut best_i = None;
         let mut best_d = 1e18f64;
@@ -450,7 +468,7 @@ fn build_from_ring(
             }
         }
         if let Some(i) = best_i {
-            if best_d < 40.0 * 40.0 {
+            if best_d < snap_limit {
                 locs[i].gLat = round_to(pl.0, 7);
                 locs[i].gLng = round_to(pl.1, 7);
             }

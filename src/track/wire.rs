@@ -74,21 +74,47 @@ pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
     })
 }
 
-/// 五点实体（实时点位 → 跑完态 isPass=true）。
+/// 判断轨迹是否实际经过某 BD-09 点位（任一轨迹点与打卡点距离 <= radius_m）。
+pub fn track_passes_bd(track: &Track, bd_lat: f64, bd_lon: f64, radius_m: f64) -> bool {
+    let r2 = radius_m * radius_m;
+    track.locations.iter().any(|loc| {
+        let dlat = (loc.gLat - bd_lat) * super::geom::MET_PER_DEG_LAT;
+        let dlon = (loc.gLng - bd_lon) * super::geom::MET_PER_DEG_LNG;
+        dlat * dlat + dlon * dlon <= r2
+    })
+}
+
+/// 五点实体（实时点位 → 按轨迹实际是否经过计算 `isPass`）。
+#[allow(dead_code)]
 pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
+    five_point_payload_for_track(points, None, start_ms)
+}
+
+/// 按轨迹实际落点距离（20m 内）判定每个打卡点的 `isPass` 状态。
+pub fn five_point_payload_for_track(
+    points: &[Value],
+    track: Option<&Track>,
+    start_ms: i64,
+) -> Vec<Value> {
     points
         .iter()
         .enumerate()
         .map(|(i, p)| {
+            let lat = p["lat"].as_f64().unwrap_or(0.0);
+            let lon = p["lon"].as_f64().unwrap_or(0.0);
+            let is_pass = match track {
+                Some(t) => track_passes_bd(t, lat, lon, 20.0),
+                None => true,
+            };
             json!({
                 "flag": start_ms,
                 "glat": p["glat"].as_f64().unwrap_or(0.0),
                 "glon": p["glon"].as_f64().unwrap_or(0.0),
                 "id": i as i64 + 1,
                 "isFixed": p["isFixed"].as_i64().unwrap_or(0),
-                "isPass": true,
-                "lat": p["lat"].as_f64().unwrap_or(0.0),
-                "lon": p["lon"].as_f64().unwrap_or(0.0),
+                "isPass": is_pass,
+                "lat": lat,
+                "lon": lon,
                 "pointName": p["pointName"].as_str().unwrap_or(""),
                 "position": 999,
                 "state": 0,
@@ -97,9 +123,23 @@ pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
         .collect()
 }
 
-/// 提交 body 的 fivePointJson 包装串。
+/// 提交 body 的 fivePointJson 包装串（默认全部通过）。
+#[allow(dead_code)]
 pub fn five_point_wrapper(points: &[Value], start_ms: i64) -> String {
     let five = five_point_payload(points, start_ms);
+    json!({
+        "useZip": false,
+        "fivePointJson": Value::Array(five).to_string(),
+        "runAreaId": -1,
+        "geoFencesJson": "[]",
+        "freedomShowFence": false,
+    })
+    .to_string()
+}
+
+/// 提交 body 的 fivePointJson 包装串（按轨迹实际经过的点位设置 `isPass`）。
+pub fn five_point_wrapper_for_track(points: &[Value], track: &Track, start_ms: i64) -> String {
+    let five = five_point_payload_for_track(points, Some(track), start_ms);
     json!({
         "useZip": false,
         "fivePointJson": Value::Array(five).to_string(),
@@ -150,6 +190,44 @@ mod validation_tests {
         assert!(laps.iter().all(|lap| lap["elevationGain"] == 0.0));
         assert!(laps.iter().all(|lap| lap["endAltAbs"] == 36.75));
         assert!(laps.iter().all(|lap| lap["endAltRel"] == 0.0));
+    }
+
+    #[test]
+    fn five_points_only_mark_actually_visited_checkpoints_and_keep_pace_in_4_to_10_min() {
+        let visited_pt = (38.901678, 121.540241);
+        let next_pt = (38.906000, 121.540241);
+        let unvisited_pt = (38.920000, 121.560000); // 距离路线 > 2km，不应被算作已打卡
+        let wps = vec![visited_pt, next_pt];
+        let track = crate::track::generator::build_ordered_mode(
+            480.0,
+            175,
+            7,
+            1_700_000_000_000,
+            &wps,
+            route_planner::CustomCloseMode::Open,
+            &[visited_pt, next_pt, unvisited_pt],
+        );
+
+        // 1. 验证打卡点判定：路线经过的为 true，未经过的为 false
+        let raw_points = vec![
+            json!({ "lat": visited_pt.0, "lon": visited_pt.1, "glat": visited_pt.0, "glon": visited_pt.1, "pointName": "P1" }),
+            json!({ "lat": unvisited_pt.0, "lon": unvisited_pt.1, "glat": unvisited_pt.0, "glon": unvisited_pt.1, "pointName": "P_FAR" }),
+        ];
+        let payload = five_point_payload_for_track(&raw_points, Some(&track), track.startTime);
+        assert_eq!(payload[0]["isPass"], json!(true), "经过的打卡点应为 isPass=true");
+        assert_eq!(payload[1]["isPass"], json!(false), "未经过的打卡点不应被算作 isPass=true");
+
+        // 2. 验证配速严格保持在 4~10 分配速（1.66~4.17 m/s）内，无突然飙升
+        for loc in track.locations.iter().skip(2) {
+            if loc.ptype != -1 && loc.ptype != 6 && loc.avgSpeed > 0.0 {
+                assert!(
+                    loc.avgSpeed >= crate::track::generator::SPEED_FLOOR - 0.05
+                        && loc.avgSpeed <= crate::track::generator::SPEED_CEIL + 0.05,
+                    "瞬时速度 {} m/s 越出 4~10 分配速窗口",
+                    loc.avgSpeed
+                );
+            }
+        }
     }
 }
 
@@ -249,7 +327,7 @@ pub fn build_obs_object(
     let run_wrap = json!({ "allLocJson": Value::Array(pts).to_string(), "useZip": false });
     let (sp, stf) = build_windows(track, rrid);
     let laps = build_laps(track, start_ms);
-    let five = five_point_payload(live_points, start_ms);
+    let five = five_point_payload_for_track(live_points, Some(track), start_ms);
     let fx = json!({
         "fivePointJson": Value::Array(five).to_string(),
         "freedomShowFence": false,

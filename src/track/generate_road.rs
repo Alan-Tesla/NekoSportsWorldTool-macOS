@@ -8,7 +8,7 @@
 //!
 //! 协议字段/哨兵/断崖/吸附/10s 窗与经典模式完全一致。
 
-use super::generator::{SPEED_CEIL, SPEED_FLOOR};
+use super::generator::{fit_speeds_bounded, SPEED_CEIL, SPEED_FLOOR};
 use super::geom::{
     fmt_gain_time, make_ordered_path, open_point_at, ring_point_at, round_to, to_bd,
     wgs84_to_bd09, Rng, MET_PER_DEG_LAT, MET_PER_DEG_LNG,
@@ -607,7 +607,7 @@ pub fn build_road(
     let must: Vec<Coord> = must_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
     let route = plan_route_split(net, &waypoints, &must, dist, seed, &opts)?;
     build_track_from_route(
-        dist, dur, seed, start_ms, &route, route_bd, route_bd, true, net,
+        dist, dur, seed, start_ms, &route, route_bd, route_bd, true, 40.0, net,
     )
 }
 
@@ -643,6 +643,7 @@ pub fn build_custom_road(
         waypoints_bd,
         snap_bd,
         close_mode.is_closed(),
+        15.0,
         net,
     )
 }
@@ -657,6 +658,7 @@ fn build_track_from_route(
     ref_bd: &[(f64, f64)],
     snap_bd: &[(f64, f64)],
     closed: bool,
+    snap_radius_m: f64,
     net: &RoadGraph,
 ) -> Result<Track, String> {
     let mut rng = Rng::new(seed);
@@ -670,12 +672,6 @@ fn build_track_from_route(
         ref_bd.iter().map(|q| q.1).sum::<f64>() / n_pts as f64,
     );
     let (dense, arcs) = route_ring(route, c_lat, c_lng);
-    let total_arc = (*arcs.last().unwrap_or(&dist)).max(1.0);
-    let arc_scale = if !closed && dist > 1.0 {
-        total_arc / dist
-    } else {
-        1.0
-    };
 
     // 时间网格（同经典模式）
     let mut times = Vec::new();
@@ -692,24 +688,25 @@ fn build_track_from_route(
     let mut dts: Vec<f64> = (0..n - 1).map(|i| times[i + 1] - times[i]).collect();
     dts.push(1.0f64.max(dur_f - times[n - 1]));
 
-    // 运动学速度剖面：OU 配速 + 弯道预判刹车 + 精确命中目标距离
+    // 运动学速度剖面：OU 配速 + 弯道预判刹车 + 围绕目标平均配速温和波动（严守 4~10 分配速窗口）
     let kin = KinParams {
         a_c_max,
         ..Default::default()
     };
+    let base_v = avg_v.clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
+    let local_floor = (base_v * 0.80).max(SPEED_FLOOR);
+    let local_ceil = (base_v * 1.18).min(SPEED_CEIL).max(local_floor + 0.05);
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let w = pace_profile(
+    let mut w = pace_profile(
         route,
-        avg_v,
+        base_v,
         &dts,
         dist,
         speed_seed,
         &kin,
-        SPEED_FLOOR,
-        SPEED_CEIL,
+        local_floor,
+        local_ceil,
     );
-    let speeds: Vec<f64> = w.clone();
-    let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
 
     // 点位类型（同经典模式）
     let tl_w = [
@@ -743,13 +740,21 @@ fn build_track_from_route(
             kinds[i] = (rng.choice(&[3, 0]), 1);
         }
     }
-    let normal_idx: Vec<usize> = (0..n).filter(|&i| kinds[i].0 != -1 && i > 1).collect();
-    let share: f64 = normal_idx.iter().map(|&i| seg_dist[i]).sum();
-    let share = if share == 0.0 { 1.0 } else { share };
-    let mut disp_of = vec![0.0f64; n];
-    for &i in &normal_idx {
-        disp_of[i] = seg_dist[i] * (dist / share);
+    for i in 0..n {
+        if i <= 1 || kinds[i].0 == -1 {
+            w[i] = 0.0;
+        }
     }
+    fit_speeds_bounded(&mut w, &dts, dist, local_floor, local_ceil);
+    let cur_sum: f64 = w.iter().zip(&dts).map(|(x, dt)| x * dt).sum();
+    if (cur_sum - dist).abs() > 2.0 {
+        fit_speeds_bounded(&mut w, &dts, dist, SPEED_FLOOR, SPEED_CEIL);
+    }
+    let disp_of: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
+    let seg_dist: Vec<f64> = disp_of.clone();
+    let speeds: Vec<f64> = (0..n)
+        .map(|i| if w[i] > 0.0 { w[i] } else { base_v })
+        .collect();
 
     // 建筑 SDF（自适应放大漂移）
     let sdf = Sdf::from_buildings(
@@ -799,7 +804,8 @@ fn build_track_from_route(
             if closed {
                 ring_point_at(&dense, &arcs, ss)
             } else {
-                open_point_at(&dense, &arcs, ss * arc_scale)
+                // 1:1 真实米制步进，保持 GPS 空间位移与累计里程配速严格一致
+                open_point_at(&dense, &arcs, ss)
             }
         };
         let mut d_step = 0.0f64;
@@ -926,21 +932,20 @@ fn build_track_from_route(
         let brg =
             ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
         let (avg_sp, gps_speed) = if typ == -1 {
-            let avg = round_to(dist_acc / t_acc.max(1.0), 4);
-            let gps = if rng.random() < 0.12 {
-                rng.uniform(15.0, 46.0)
-            } else {
-                rng.uniform(0.5, 6.0)
-            };
+            let avg = round_to((dist_acc / t_acc.max(1.0)).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
+            let gps = rng.uniform(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6);
             (avg, round_to(gps, 4))
         } else {
-            let avg = round_to(d_step / dt, 4);
+            let avg = round_to((d_step / dt).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
             let kmh = avg * 3.6;
-            let sigma = (kmh * 0.08).max(0.05);
+            let sigma = (kmh * 0.06).max(0.05);
             let gps = if rng.random() < 0.20 {
                 0.0
             } else {
-                round_to((kmh + rng.gauss(0.0, sigma)).max(0.0), 4)
+                round_to(
+                    (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
+                    4,
+                )
             };
             (avg, gps)
         };
@@ -1034,7 +1039,8 @@ fn build_track_from_route(
 
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
-    // 点位吸附：<40m 精确落位（全量打卡点，含必经点与普通打卡点）
+    // 点位吸附：自动路由模式 <40m 吸附；自定义规划模式仅在 <=15m 时吸附，不把路线未经过的点强行拉过来
+    let snap_limit = snap_radius_m * snap_radius_m;
     for pl in snap_bd {
         let mut best_i = None;
         let mut best_d = 1e18f64;
@@ -1047,7 +1053,7 @@ fn build_track_from_route(
             }
         }
         if let Some(i) = best_i {
-            if best_d < 40.0 * 40.0 {
+            if best_d < snap_limit {
                 locs[i].gLat = round_to(pl.0, 7);
                 locs[i].gLng = round_to(pl.1, 7);
             }

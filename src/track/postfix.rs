@@ -80,7 +80,7 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
             }
         }
         if locs[0].speed == 0.0 {
-            locs[0].speed = round_to(rng.uniform(7.0, 13.0), 4);
+            locs[0].speed = round_to(rng.uniform(7.0, 12.5), 4);
         }
     }
 }

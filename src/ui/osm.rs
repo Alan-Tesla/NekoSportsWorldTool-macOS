@@ -487,15 +487,23 @@ impl App {
                     .map
                     .draw_polygon(&clipped, canvas, f, fence_color, 2.2);
             }
-            // 学校打卡点（金色圆点 + 白边）
-            let cp_color = egui::Color32::from_rgb(240, 180, 0);
+            // 学校打卡点（已途经亮绿 / 未途经金色圆点 + 白边）
+            let cp_pass = egui::Color32::from_rgb(16, 185, 129);
+            let cp_unpass = egui::Color32::from_rgb(240, 180, 0);
             for &(la, lo) in &p.checkpoints {
+                let hit = p.route.iter().any(|&(rla, rlo)| {
+                    let dx = (rla - la) * crate::track::geom::MET_PER_DEG_LAT;
+                    let dy = (rlo - lo) * crate::track::geom::MET_PER_DEG_LNG;
+                    dx * dx + dy * dy <= 16.0 * 16.0
+                });
                 let sp = self.osm_page.map.to_screen(canvas, la, lo);
                 if canvas.contains(sp) {
-                    clipped.circle_filled(sp, 5.0, cp_color);
+                    let c = if hit { cp_pass } else { cp_unpass };
+                    let r = if hit { 5.8 } else { 4.6 };
+                    clipped.circle_filled(sp, r, c);
                     clipped.circle_stroke(
                         sp,
-                        5.0,
+                        r,
                         egui::Stroke::new(1.4_f32, egui::Color32::WHITE),
                     );
                 }

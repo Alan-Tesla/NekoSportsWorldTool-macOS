@@ -189,8 +189,8 @@ impl RunPage {
             self.dist_min.max(self.dist_max),
         );
         let (plo, phi) = (
-            self.pace_min.min(self.pace_max),
-            self.pace_min.max(self.pace_max),
+            self.pace_min.min(self.pace_max).clamp(240.0, 600.0),
+            self.pace_min.max(self.pace_max).clamp(240.0, 600.0),
         );
         let pace = plo + (phi - plo) * rand::random::<f32>();
         let dist = match self.effective_custom_km() {
@@ -367,12 +367,14 @@ impl App {
                     draw_distance_inputs(ui);
                 });
             }
+            page.pace_min = page.pace_min.clamp(240.0, 600.0);
+            page.pace_max = page.pace_max.clamp(240.0, 600.0);
             let mut draw_pace_inputs = |ui: &mut egui::Ui| {
                 mobile::drag_f32(
                     ui,
                     "run_pace_min",
                     &mut page.pace_min,
-                    180.0..=520.0,
+                    240.0..=600.0,
                     5.0,
                     0,
                     "",
@@ -382,11 +384,12 @@ impl App {
                     ui,
                     "run_pace_max",
                     &mut page.pace_max,
-                    180.0..=520.0,
+                    240.0..=600.0,
                     5.0,
                     0,
                     "",
                 );
+                ui.label("（4:00~10:00/km）");
             };
             if compact {
                 ui.label("配速范围（秒/km）：");
@@ -904,15 +907,27 @@ impl App {
                     .map
                     .draw_polygon(&clipped, canvas, f, fence_c, 2.0);
             }
-            let cp = egui::Color32::from_rgb(240, 180, 0);
+            let cp_pass = egui::Color32::from_rgb(16, 185, 129);
+            let cp_unpass = egui::Color32::from_rgb(240, 180, 0);
+            let mut passed_cp_count = 0usize;
             for &(la, lo) in &p.checkpoints {
+                let hit = p.route.iter().any(|&(rla, rlo)| {
+                    let dx = (rla - la) * crate::track::geom::MET_PER_DEG_LAT;
+                    let dy = (rlo - lo) * crate::track::geom::MET_PER_DEG_LNG;
+                    dx * dx + dy * dy <= 16.0 * 16.0
+                });
+                if hit {
+                    passed_cp_count += 1;
+                }
                 let sp = self.run_page.map.to_screen(canvas, la, lo);
                 if canvas.contains(sp) {
-                    clipped.circle_filled(sp, 4.5, cp);
+                    let c = if hit { cp_pass } else { cp_unpass };
+                    let r = if hit { 5.5 } else { 4.2 };
+                    clipped.circle_filled(sp, r, c);
                     clipped.circle_stroke(
                         sp,
-                        4.5,
-                        egui::Stroke::new(1.2_f32, egui::Color32::WHITE),
+                        r,
+                        egui::Stroke::new(1.3_f32, egui::Color32::WHITE),
                     );
                 }
             }
@@ -955,20 +970,22 @@ impl App {
             } else if p.length_m > 0.0 {
                 if is_custom && close_mode_now == CustomCloseMode::Open {
                     format!(
-                        "本次方案 {:.2} km · 开环总长 {:.0} m · {} 途经点 · {} 打卡点",
+                        "本次方案 {:.2} km · 开环总长 {:.0} m · 已途经打卡点 {}/{} · {} 途经点",
                         plan.dist,
                         p.length_m,
-                        self.config.custom_waypoints.len(),
+                        passed_cp_count,
                         p.checkpoints.len(),
+                        self.config.custom_waypoints.len(),
                     )
                 } else {
                     let loops = plan.dist * 1000.0 / p.length_m;
                     if loops > 1.15 {
                         format!(
-                            "本次方案 {:.2} km · 单圈 {:.0} m × {:.1} 圈 · {} 打卡点{}",
+                            "本次方案 {:.2} km · 单圈 {:.0} m × {:.1} 圈 · 已途经打卡点 {}/{}{}",
                             plan.dist,
                             p.length_m,
                             loops,
+                            passed_cp_count,
                             p.checkpoints.len(),
                             if is_custom {
                                 format!(" · {} 途经点", self.config.custom_waypoints.len())
@@ -978,9 +995,10 @@ impl App {
                         )
                     } else {
                         format!(
-                            "本次方案 {:.2} km · 路线 {:.0} m · {} 打卡点{}",
+                            "本次方案 {:.2} km · 路线 {:.0} m · 已途经打卡点 {}/{}{}",
                             plan.dist,
                             p.length_m,
+                            passed_cp_count,
                             p.checkpoints.len(),
                             if is_custom {
                                 format!(" · {} 途经点", self.config.custom_waypoints.len())

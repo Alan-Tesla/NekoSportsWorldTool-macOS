@@ -10,7 +10,7 @@ use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::location::Coordinate;
 use crate::track::generate_road::RouteMode;
 use crate::track::generator::build as gen_track;
-use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
+use crate::track::wire::{build_obs_object, five_point_wrapper_for_track, obs_keys, track_passes_bd};
 use rand_distr::{Distribution, Normal};
 use serde_json::Value;
 
@@ -261,6 +261,25 @@ pub fn run_full_flow(
                 log("⚠ [track] 自定义规划路径尚未添加途经点，回退使用打卡点序列");
                 route_pts.clone()
             };
+            // 若为自定义路径，先根据实际规划路线长度校准 params.dist 与 params.dur（保持原配速且锁定在 4~10 分配速内），
+            // 确保开环单程从起点完整跑到终点且 1:1 真实米制配速不失真。
+            if custom_wps.len() >= 2 && !close_mode.is_closed() {
+                let (_, arcs, _) = crate::track::geom::make_ordered_path(&custom_wps, close_mode);
+                let geom_len = *arcs.last().unwrap_or(&0.0);
+                if geom_len > 100.0 && (geom_len - params.dist).abs() > 20.0 {
+                    let pace_s_per_m = (params.dur as f64 / params.dist.max(1.0))
+                        .clamp(1.0 / crate::track::generator::SPEED_CEIL, 1.0 / crate::track::generator::SPEED_FLOOR);
+                    params.dist = geom_len;
+                    params.dur = (geom_len * pace_s_per_m).round() as i64;
+                    log(&format!(
+                        "[track] 开环路径实际长度 {:.0}m，已同步跑步距离与时长为 {:.0}m / {}s（配速 {:.0}秒/km）",
+                        geom_len,
+                        params.dist,
+                        params.dur,
+                        pace_s_per_m * 1000.0
+                    ));
+                }
+            }
             log(&format!(
                 "[track] 自定义路径规划：{} 个途经点，方式={}，模式={}",
                 custom_wps.len(),
@@ -380,8 +399,17 @@ pub fn run_full_flow(
             .unwrap_or_default(),
     ));
 
-    // ④ 五点 wrapper（跑完态）
-    let five = five_point_wrapper(&pts, track.startTime);
+    // ④ 五点 wrapper（按轨迹实际经过的距离判定 isPass，未经过的点位不会误标为已打卡）
+    let passed_cnt = pts_bd
+        .iter()
+        .filter(|&&(la, lo)| track_passes_bd(&track, la, lo, 20.0))
+        .count();
+    log(&format!(
+        "√ [points] 本次路线实际经过打卡点 {}/{} 个",
+        passed_cnt,
+        pts_bd.len()
+    ));
+    let five = five_point_wrapper_for_track(&pts, &track, track.startTime);
     let _ = &five;
 
     // ⑤ 提交（sportType=1）
