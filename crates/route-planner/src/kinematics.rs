@@ -93,21 +93,21 @@ pub fn pace_profile(
     let total_time_est: f64 = dts.iter().sum::<f64>().max(1.0);
 
     // ① 平稳自然的「前快后慢」体能曲线（参考真实学生跑步数据）：
-    //   - 前程体能充沛（比平均配速快 16~18%，如实测首公里 5'48" vs 平均 7'17"）；
-    //   - 中程平缓巡航过渡到平均配速；
-    //   - 后程渐进疲劳减速（比平均配速慢 16~18%，如实测后程 8'05"~9'02"）；
-    //   - 采用平滑三次 S 曲线 + 微幅 OU 扰动（标准差仅 0.012 m/s），消除高频剧烈跳跃，曲线平稳自然。
+    //   - 起程体能充沛（比平均配速快 6%~7%，如 7'17" 均速起步约 6'48"）；
+    //   - 中程平缓巡航自然过渡到平均配速（7'17"）；
+    //   - 后程渐进疲劳平滑减速（比平均配速慢 6%~7%，后程约 7'50"）；
+    //   - 采用平滑三次 S 曲线 + 微幅平滑扰动（消除折线图大幅剧烈跳变与锯齿，保持自然微波带）。
     let mut w = Vec::with_capacity(n);
-    let mut v = v0 * 1.18;
+    let mut v = v0 * 1.07;
     let mut t = 0.0;
     for &dt in dts {
         let u = (t / total_time_est).clamp(0.0, 1.0);
-        // S 形平滑过渡因子：从 u=0 时的 1.18 渐变到 u=1 时的 0.82，积分均值恰好为 1.00
+        // S 形平滑过渡因子：从 u=0 时的 1.07 渐变到 u=1 时的 0.93，积分均值严格为 1.00
         let s_curve = 3.0 * u * u - 2.0 * u * u * u;
-        let pacing_factor = 1.18 - 0.36 * s_curve;
+        let pacing_factor = 1.07 - 0.14 * s_curve;
         let target_v = (v0 * pacing_factor).clamp(floor, ceil);
-        // 极轻微的自然步频/体能微起伏（消除上下剧烈跳动）
-        v = v + 0.12 * (target_v - v) * dt + 0.012 * dt.sqrt() * normal.sample(&mut rng);
+        // 自然平缓的步频/体能微波动（每步标准差微幅控制在 0.005，彻底消除上下大幅震荡）
+        v = v + 0.10 * (target_v - v) * dt + 0.005 * dt.sqrt() * normal.sample(&mut rng);
         v = v.clamp(floor, ceil);
         w.push(v);
         t += dt;
@@ -121,10 +121,16 @@ pub fn pace_profile(
         s += w[i] * dts[i];
     }
 
-    // ③ 弯道预判限速 cap（钳到有效窗口内）
+    // ③ 弯道柔和限速 cap（人在 2~3m/s 跑步时，弯道仅微调步幅，最多减速 3%~5%，绝不下砸到步行）
+    let turn_floor = (v0 * 0.95).max(floor);
     let mut caps = Vec::with_capacity(n);
     for i in 0..n {
-        let cap = speed_limit_ahead(route, s_of[i], p).clamp(floor, ceil);
+        let raw_cap = speed_limit_ahead(route, s_of[i], p);
+        let cap = if raw_cap.is_finite() {
+            raw_cap.max(turn_floor).min(ceil)
+        } else {
+            ceil
+        };
         w[i] = w[i].min(cap);
         caps.push(cap);
     }

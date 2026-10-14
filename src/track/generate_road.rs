@@ -997,8 +997,8 @@ fn build_track_from_route(
         ..Default::default()
     };
     let base_v = avg_v.clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
-    let local_floor = (base_v * 0.80).max(SPEED_FLOOR);
-    let local_ceil = (base_v * 1.18).min(SPEED_CEIL).max(local_floor + 0.05);
+    let local_floor = (base_v * 0.90).max(SPEED_FLOOR);
+    let local_ceil = (base_v * 1.10).min(SPEED_CEIL).max(local_floor + 0.05);
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut w = pace_profile(
         route,
@@ -1212,6 +1212,8 @@ fn build_track_from_route(
             value: round_to(out_st, 0),
         });
     }
+    // 消除离散时间窗锯齿与大幅跳变，生成平稳连续、符合自然生理律动的 10 秒配速曲线
+    super::generator::smooth_ten_sec_windows(dur, dist, seed, &mut ten_speed, &mut ten_steps);
 
     let mut segments: Vec<Segment> = Vec::new();
     let (mut seg_t, mut seg_d) = (0.0f64, 0.0f64);

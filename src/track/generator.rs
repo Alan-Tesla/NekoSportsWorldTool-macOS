@@ -40,6 +40,93 @@ pub fn fit_speeds_bounded(w: &mut [f64], dts: &[f64], target: f64, floor: f64, c
     }
 }
 
+/// 平滑 10 秒时间窗（彻底消除折线图大幅跳动与锯齿，呈现平稳自然的真实体能微波曲线）。
+///
+/// 真实跑步中，10 秒时间窗位移是极度平滑连续的（相邻窗口差值通常 <0.35m，即配速变动 <8秒/km）。
+/// 本函数根据目标总距离、总时长及前快后慢体能曲线生成平滑基准，叠加一阶连续 AR(1) 微波，
+/// 并严格归一化守恒总距离，同时满足步频/步幅生物力学约束。
+pub fn smooth_ten_sec_windows(
+    dur: i64,
+    dist: f64,
+    seed: u64,
+    windows_speed: &mut Vec<TenWindow>,
+    windows_steps: &mut Vec<TenWindow>,
+) {
+    if windows_speed.is_empty() {
+        return;
+    }
+    let m = windows_speed.len();
+    let dur_f = dur as f64;
+    let base_v = (dist / dur_f.max(1.0)).clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
+    let mut rng = Rng::new(seed.wrapping_add(0x85EB_CA6B_14E5_B231));
+
+    let mut vals: Vec<f64> = Vec::with_capacity(m);
+    let mut steps_vals: Vec<f64> = Vec::with_capacity(m);
+    let mut drift = 0.0f64;
+
+    for i in 0..m {
+        let win_t = windows_speed[i].time as f64;
+        let mid_t = (i as f64 * 10.0 + win_t * 0.5).min(dur_f);
+        let u = (mid_t / dur_f.max(1.0)).clamp(0.0, 1.0);
+        // S 形自然体能衰减（起步快 6~7%，终点慢 6~7%，全程积分均值严格为 1.00）
+        let s_curve = 3.0 * u * u - 2.0 * u * u * u;
+        let pacing_factor = 1.07 - 0.14 * s_curve;
+        let target_v = base_v * pacing_factor;
+
+        // AR(1) 微幅生理律动（标准差仅 0.006 m/s，相邻窗变动 < 0.20m）
+        drift = 0.72 * drift + rng.gauss(0.0, 0.006);
+        let cur_v = (target_v + drift).clamp(SPEED_FLOOR, SPEED_CEIL);
+        let d = cur_v * win_t;
+        vals.push(d);
+    }
+
+    // 相邻窗口平滑限斜率（slew rate limiter）：相邻 10 秒窗口位移差不超过 0.35m
+    for i in 1..m {
+        let max_step = 0.35 * (windows_speed[i].time as f64 / 10.0);
+        let diff = vals[i] - vals[i - 1];
+        if diff.abs() > max_step {
+            vals[i] = vals[i - 1] + diff.signum() * max_step;
+        }
+    }
+    // 逆向反扫一次，保证双向连续无突兀拐点
+    for i in (0..m - 1).rev() {
+        let max_step = 0.35 * (windows_speed[i].time as f64 / 10.0);
+        let diff = vals[i] - vals[i + 1];
+        if diff.abs() > max_step {
+            vals[i] = vals[i + 1] + diff.signum() * max_step;
+        }
+    }
+
+    // 归一化缩放：精确守恒目标总位移
+    let cur_sum: f64 = vals.iter().sum();
+    if cur_sum > 1e-3 {
+        let k = dist / cur_sum;
+        for (i, v) in vals.iter_mut().enumerate() {
+            let win_t = windows_speed[i].time as f64;
+            let floor_d = 17.50 * (win_t / 10.0);
+            let ceil_d = 41.00 * (win_t / 10.0);
+            *v = (*v * k).clamp(floor_d, ceil_d);
+        }
+    }
+
+    // 联动计算步频步数：均值约 185 spm，均值步幅约 74cm
+    for i in 0..m {
+        let win_t = windows_speed[i].time as f64;
+        let d = vals[i];
+        let v = d / win_t.max(0.1);
+        // 速度稍快时步频略升（182~188），步幅约 72~76cm
+        let cad = (175.0 + 3.8 * v + rng.gauss(0.0, 0.8)).clamp(168.0, 198.0);
+        let st = (cad / 60.0 * win_t).round();
+        steps_vals.push(st.clamp(25.0, 42.0));
+    }
+
+    // 回写到原数组
+    for i in 0..m {
+        windows_speed[i].value = round_to(vals[i], 2);
+        windows_steps[i].value = round_to(steps_vals[i], 0);
+    }
+}
+
 /// 轨迹生成主入口。points_bd 为 BD 系打卡点。
 pub fn build(
     dist: f64,
@@ -143,24 +230,24 @@ fn build_from_ring(
     dts.push(1.0f64.max(dur_f - times[n - 1]));
 
     let base = (dist / dur_f).clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
-    let local_floor = (base * 0.80).max(SPEED_FLOOR);
-    let local_ceil = (base * 1.20).min(SPEED_CEIL).max(local_floor + 0.05);
+    let local_floor = (base * 0.90).max(SPEED_FLOOR);
+    let local_ceil = (base * 1.10).min(SPEED_CEIL).max(local_floor + 0.05);
 
     // 平稳自然的「前快后慢」体能曲线（参考真实学生跑步数据）：
-    //   - 前程体能充沛（比平均配速快 16~18%，如实测首公里 5'48" vs 平均 7'17"）；
-    //   - 中程平缓巡航过渡到平均配速；
-    //   - 后程渐进疲劳减速（比平均配速慢 16~18%，如实测后程 8'05"~9'02"）；
-    //   - 采用平滑三次 S 曲线 + 极微幅高斯微扰（消除上下剧烈颠簸跳动），曲线平稳自然。
+    //   - 起程体能充沛（比平均配速快 6%~7%，如 7'17" 均速起步约 6'48"）；
+    //   - 中程平缓巡航过渡到平均配速（7'17"）；
+    //   - 后程渐进疲劳平缓减速（比平均配速慢 6%~7%，后程约 7'50"）；
+    //   - 采用平滑三次 S 曲线 + 微幅平滑扰动（彻底消除上下大幅震荡与锯齿）。
     let mut w = Vec::with_capacity(n);
-    let mut v = (base * 1.18).clamp(local_floor, local_ceil);
+    let mut v = (base * 1.07).clamp(local_floor, local_ceil);
     for i in 0..n {
         let tt = times[i];
         let dt = dts[i];
         let u = (tt / dur_f).clamp(0.0, 1.0);
         let s_curve = 3.0 * u * u - 2.0 * u * u * u;
-        let pacing_factor = 1.18 - 0.36 * s_curve;
+        let pacing_factor = 1.07 - 0.14 * s_curve;
         let target_v = (base * pacing_factor).clamp(local_floor, local_ceil);
-        v = v + 0.12 * (target_v - v) * dt + rng.gauss(0.0, 0.008);
+        v = v + 0.10 * (target_v - v) * dt + rng.gauss(0.0, 0.005);
         v = v.clamp(local_floor, local_ceil);
         w.push(v);
     }
@@ -336,6 +423,8 @@ fn build_from_ring(
         ten_speed.push(TenWindow { time: 10, value: round_to(out_d, 2) });
         ten_steps.push(TenWindow { time: 10, value: round_to(out_st, 0) });
     }
+    // 消除离散时间窗锯齿与大幅跳变，生成平稳连续、符合自然生理律动的 10 秒配速曲线
+    smooth_ten_sec_windows(dur, dist, seed, &mut ten_speed, &mut ten_steps);
 
     let mut segments: Vec<Segment> = Vec::new();
     let (mut seg_t, mut seg_d, mut seg_n) = (0.0f64, 0.0f64, 0i64);
