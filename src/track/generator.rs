@@ -326,11 +326,8 @@ fn build_from_ring(
             },
             2,
         );
-        let state = if typ == 0 {
-            rng.weighted(&[(1, 145), (2, 45), (3, 164)])
-        } else {
-            rng.weighted(&[(1, 145), (2, 256), (3, 151)])
-        };
+        // 全程纯绿连续运动状态：state=1（绝不注入 state=2 静止标签，防止 App 误判为中途暂停）
+        let state = 1;
         dist_acc += d_step;
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
         alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
@@ -456,11 +453,15 @@ fn build_from_ring(
 
     // 点位吸附：经典模式 <40m 吸附；自定义规划模式（pin_start=true）仅在 <=15m 时吸附，
     // 防止把用户未经过、距离路线二三十米外的打卡点强行拉过来算作已打卡。
+    // 同时跳过哨兵点（i<=1 或末点），并确保吸附后不与前后相邻点发生坐标重合，杜绝原地静止被误判为暂停。
     let snap_limit = if pin_start { 15.0 * 15.0 } else { 40.0 * 40.0 };
     for pl in points_bd {
         let mut best_i = None;
         let mut best_d = 1e18f64;
         for (i, q) in locs.iter().enumerate() {
+            if i <= 1 || i >= locs.len() - 1 {
+                continue;
+            }
             let dd = ((q.gLat - pl.0) * MET_PER_DEG_LAT).powi(2)
                 + ((q.gLng - pl.1) * MET_PER_DEG_LNG).powi(2);
             if dd < best_d {
@@ -470,8 +471,14 @@ fn build_from_ring(
         }
         if let Some(i) = best_i {
             if best_d < snap_limit {
-                locs[i].gLat = round_to(pl.0, 7);
-                locs[i].gLng = round_to(pl.1, 7);
+                let d_prev = ((pl.0 - locs[i - 1].gLat) * MET_PER_DEG_LAT)
+                    .hypot((pl.1 - locs[i - 1].gLng) * MET_PER_DEG_LNG);
+                let d_next = ((locs[i + 1].gLat - pl.0) * MET_PER_DEG_LAT)
+                    .hypot((locs[i + 1].gLng - pl.1) * MET_PER_DEG_LNG);
+                if d_prev >= 1.5 && d_next >= 1.5 {
+                    locs[i].gLat = round_to(pl.0, 7);
+                    locs[i].gLng = round_to(pl.1, 7);
+                }
             }
         }
     }

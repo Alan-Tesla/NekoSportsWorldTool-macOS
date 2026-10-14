@@ -45,6 +45,7 @@ impl Rng {
     {
         items[rand::Rng::gen_range(&mut self.inner, 0..items.len())]
     }
+    #[allow(dead_code)]
     pub fn weighted<T>(&mut self, items: &[(T, u32)]) -> T
     where
         T: Copy,
