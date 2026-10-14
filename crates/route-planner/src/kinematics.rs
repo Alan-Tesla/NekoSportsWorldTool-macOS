@@ -92,44 +92,22 @@ pub fn pace_profile(
     let normal = Normal::<f64>::new(0.0, 1.0).unwrap();
     let total_time_est: f64 = dts.iter().sum::<f64>().max(1.0);
 
-    // 后半程疲劳喘息凹陷（实测配速图中后段的下坠齿状特征）
-    let n_dips = rand::Rng::gen_range(&mut rng, 2..=4);
-    let mut dips = Vec::with_capacity(n_dips);
-    for _ in 0..n_dips {
-        dips.push((
-            rand::Rng::gen_range(&mut rng, 0.42..0.92) * total_time_est,
-            rand::Rng::gen_range(&mut rng, 18.0..36.0),
-            rand::Rng::gen_range(&mut rng, 0.08..0.18),
-        ));
-    }
-    let dip_factor = |t: f64| -> f64 {
-        let mut f = 1.0;
-        for &(center, hw, depth) in &dips {
-            if (t - center).abs() < hw {
-                f *= 1.0 - depth * 0.5 * (1.0 + (std::f64::consts::PI * (t - center) / hw).cos());
-            }
-        }
-        f
-    };
-
-    // ① 真实体能分配与疲劳渐进曲线：
-    //   - 前段（0~1km/前25%）：轻快充沛（比平均配速快 15~20%，如实测首公里 5'48" vs 平均 7'17"）；
-    //   - 中段（1~2km/25%~60%）：巡航平稳（比平均配速快 5~10%，如实测第2公里 6'45"）；
-    //   - 后段（2km以后/60%~100%）：疲劳显著衰减（比平均配速慢 15~25%，如实测第3公里 8'05"、末段 9'02"）。
+    // ① 平稳自然的「前快后慢」体能曲线（参考真实学生跑步数据）：
+    //   - 前程体能充沛（比平均配速快 16~18%，如实测首公里 5'48" vs 平均 7'17"）；
+    //   - 中程平缓巡航过渡到平均配速；
+    //   - 后程渐进疲劳减速（比平均配速慢 16~18%，如实测后程 8'05"~9'02"）；
+    //   - 采用平滑三次 S 曲线 + 微幅 OU 扰动（标准差仅 0.012 m/s），消除高频剧烈跳跃，曲线平稳自然。
     let mut w = Vec::with_capacity(n);
-    let mut v = v0;
+    let mut v = v0 * 1.18;
     let mut t = 0.0;
     for &dt in dts {
-        let frac = (t / total_time_est).clamp(0.0, 1.0);
-        let pacing_curve = if frac < 0.28 {
-            1.20 - 0.12 * (frac / 0.28)
-        } else if frac < 0.60 {
-            1.08 - 0.10 * ((frac - 0.28) / 0.32)
-        } else {
-            0.98 - 0.20 * ((frac - 0.60) / 0.40)
-        };
-        let target_v = v0 * pacing_curve * dip_factor(t);
-        v = v + p.theta * (target_v - v) * dt + p.sigma * dt.sqrt() * normal.sample(&mut rng);
+        let u = (t / total_time_est).clamp(0.0, 1.0);
+        // S 形平滑过渡因子：从 u=0 时的 1.18 渐变到 u=1 时的 0.82，积分均值恰好为 1.00
+        let s_curve = 3.0 * u * u - 2.0 * u * u * u;
+        let pacing_factor = 1.18 - 0.36 * s_curve;
+        let target_v = (v0 * pacing_factor).clamp(floor, ceil);
+        // 极轻微的自然步频/体能微起伏（消除上下剧烈跳动）
+        v = v + 0.12 * (target_v - v) * dt + 0.012 * dt.sqrt() * normal.sample(&mut rng);
         v = v.clamp(floor, ceil);
         w.push(v);
         t += dt;

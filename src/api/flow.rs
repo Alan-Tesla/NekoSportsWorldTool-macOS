@@ -56,6 +56,7 @@ pub fn run_full_flow(
         "√ [policy] ts={} policy={} minDistance={} validTime={}",
         pol.timestamp, pol.policy, pol.min_distance, pol.valid_time
     ));
+    let _ = crate::api::model::save_must_points_cache(&pol.must_points);
     sleep_secs(2);
 
     // ② 实时点位（拒绝本地样本兜底）

@@ -71,6 +71,27 @@ impl PlannerEdit {
     }
 }
 
+/// 打卡点实际覆盖情况汇总。
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointSummary {
+    pub must_passed: usize,
+    pub must_total: usize,
+    pub ord_passed: usize,
+    pub ord_total: usize,
+    pub missing_must: Vec<(f64, f64)>,
+    pub missing_ord: Vec<(f64, f64)>,
+}
+
+impl CheckpointSummary {
+    pub fn all_must_passed(&self) -> bool {
+        self.must_passed >= self.must_total
+    }
+
+    pub fn skipped_ord(&self) -> usize {
+        self.ord_total.saturating_sub(self.ord_passed)
+    }
+}
+
 /// 地图视图状态（世界坐标为度，BD-09 工作系）。
 pub struct MapState {
     /// 参考中心（lat, lon）。
@@ -1055,26 +1076,28 @@ impl MapState {
         }
     }
 
-    /// 绘制打卡点并计算实际经过情况：
-    /// - 路线 20m 内经过的打卡点：绿色实心圆 + 白色对勾「√」；
-    /// - 未经过的打卡点：亮橙色实心圆 + 序号标，鼠标悬停显示距路线差多少米；
-    /// 返回 `(passed_count, total_count, passed_flags)`。
+    /// 绘制打卡点并按「必经点」与「普通点」分级计算覆盖情况与渲染提示：
+    /// - 必经点：绘制专属「必」字徽章，未经过时呈现高警示红色光晕，提示「必须打卡，否则直接未达标！」；
+    /// - 普通点：已途经绘制绿底「√」，未途经绘制橙底编号，提示距离与可跳过说明；
+    /// 返回 `CheckpointSummary`。
     pub fn draw_checkpoints(
         &self,
         painter: &egui::Painter,
         rect: Rect,
         checkpoints: &[(f64, f64)],
+        must_points: &[(f64, f64)],
         route: &[(f64, f64)],
-    ) -> (usize, usize, Vec<bool>) {
+    ) -> CheckpointSummary {
         let clipped = painter.with_clip_rect(rect);
-        let total = checkpoints.len();
-        let mut passed_flags = Vec::with_capacity(total);
-        let mut passed_count = 0usize;
+        let mut summary = CheckpointSummary::default();
         let hover_pos = self
             .hover_coord
             .map(|(lat, lon)| self.to_screen(rect, lat, lon));
 
         for (i, &(cla, clo)) in checkpoints.iter().enumerate() {
+            let is_must = must_points
+                .iter()
+                .any(|&(mla, mlo)| (mla - cla).abs() < 1e-4 && (mlo - clo).abs() < 1e-4);
             let min_d_m = route
                 .iter()
                 .map(|&(rla, rlo)| {
@@ -1084,23 +1107,68 @@ impl MapState {
                 })
                 .fold(f64::INFINITY, f64::min);
             let is_pass = min_d_m <= 20.0;
-            if is_pass {
-                passed_count += 1;
+
+            if is_must {
+                summary.must_total += 1;
+                if is_pass {
+                    summary.must_passed += 1;
+                } else {
+                    summary.missing_must.push((cla, clo));
+                }
+            } else {
+                summary.ord_total += 1;
+                if is_pass {
+                    summary.ord_passed += 1;
+                } else {
+                    summary.missing_ord.push((cla, clo));
+                }
             }
-            passed_flags.push(is_pass);
 
             let pos = self.to_screen(rect, cla, clo);
             if !rect.expand(20.0).contains(pos) {
                 continue;
             }
             let is_hover = hover_pos.map_or(false, |p| p.distance(pos) <= 15.0);
-            let fill = if is_pass {
-                Color32::from_rgb(16, 185, 129)
+
+            let (fill, stroke_color, text) = if is_must {
+                if is_pass {
+                    (
+                        Color32::from_rgb(16, 185, 129),
+                        Color32::from_rgb(245, 158, 11),
+                        "必".to_string(),
+                    )
+                } else {
+                    (
+                        Color32::from_rgb(220, 38, 38),
+                        Color32::WHITE,
+                        "必".to_string(),
+                    )
+                }
+            } else if is_pass {
+                (
+                    Color32::from_rgb(16, 185, 129),
+                    Color32::WHITE,
+                    "√".to_string(),
+                )
             } else {
-                Color32::from_rgb(245, 158, 11)
+                (
+                    Color32::from_rgb(245, 158, 11),
+                    Color32::WHITE,
+                    format!("{}", i + 1),
+                )
             };
-            let radius = if is_hover { 7.5 } else { 6.0 };
-            if !is_pass || is_hover {
+
+            let radius = if is_hover || is_must { 7.5 } else { 6.0 };
+            if is_must && !is_pass {
+                clipped.circle_stroke(
+                    pos,
+                    radius + 4.0,
+                    Stroke::new(
+                        2.0_f32,
+                        Color32::from_rgba_unmultiplied(220, 38, 38, 160),
+                    ),
+                );
+            } else if !is_pass || is_hover {
                 clipped.circle_stroke(
                     pos,
                     radius + 3.0,
@@ -1111,29 +1179,32 @@ impl MapState {
                 );
             }
             clipped.circle_filled(pos, radius, fill);
-            clipped.circle_stroke(pos, radius, Stroke::new(1.4_f32, Color32::WHITE));
-            let text = if is_pass {
-                "√".to_string()
-            } else {
-                format!("{}", i + 1)
-            };
+            clipped.circle_stroke(pos, radius, Stroke::new(1.4_f32, stroke_color));
             clipped.text(
                 pos,
                 Align2::CENTER_CENTER,
                 text,
-                FontId::proportional(9.5),
+                FontId::proportional(if is_must { 10.0 } else { 9.5 }),
                 Color32::WHITE,
             );
 
             if is_hover {
-                let tip = if is_pass {
-                    format!("打卡点 #{}: 已途经 (距路线 {:.1}m) √", i + 1, min_d_m)
+                let tip = if is_must {
+                    if is_pass {
+                        format!("必经打卡点 #{}: 已途经 (距路线 {:.1}m) √", i + 1, min_d_m)
+                    } else {
+                        format!("必经打卡点 #{}: 未途经！必须打卡，否则直接未达标！⚠", i + 1)
+                    }
+                } else if is_pass {
+                    format!("普通打卡点 #{}: 已途经 (距路线 {:.1}m) √", i + 1, min_d_m)
                 } else if min_d_m.is_finite() {
-                    format!("打卡点 #{}: 未途经 (还差 {:.0}m) ⚠", i + 1, min_d_m)
+                    format!("普通打卡点 #{}: 未途经 (还差 {:.0}m，按规则可跳过)", i + 1, min_d_m)
                 } else {
-                    format!("打卡点 #{}: 未途经 ⚠", i + 1)
+                    format!("普通打卡点 #{}: 未途经（按规则可跳过）", i + 1)
                 };
-                let tip_bg = if is_pass {
+                let tip_bg = if is_must && !is_pass {
+                    Color32::from_rgb(185, 28, 28)
+                } else if is_pass {
                     Color32::from_rgb(6, 95, 70)
                 } else {
                     Color32::from_rgb(146, 64, 14)
@@ -1142,7 +1213,7 @@ impl MapState {
                 clipped.rect_filled(
                     Rect::from_center_size(
                         tip_pos,
-                        Vec2::new(tip.chars().count() as f32 * 11.0 + 8.0, 16.0),
+                        Vec2::new(tip.chars().count() as f32 * 11.2 + 10.0, 16.0),
                     ),
                     egui::Rounding::same(3.0),
                     tip_bg,
@@ -1156,7 +1227,7 @@ impl MapState {
                 );
             }
         }
-        (passed_count, total, passed_flags)
+        summary
     }
 
     /// 绘制带序号、起终点及自定义特殊标记（如「入」「出」）的途经点徽章。
@@ -1528,5 +1599,34 @@ mod tests {
         let mid12 = Pos2::new((p1.x + p2.x) * 0.5 - 4.0, (p1.y + p2.y) * 0.5);
         let hit12 = map.find_route_segment_hit(rect, mid12, &wps, &wps).unwrap();
         assert_eq!(hit12.0, 2);
+    }
+
+    #[test]
+    fn checkpoint_summary_distinguishes_must_and_ordinary_points() {
+        let map = MapState::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+        let painter = egui::Painter::new(
+            egui::Context::default(),
+            egui::LayerId::background(),
+            rect,
+        );
+
+        let must_pt = (38.888000, 121.528000);
+        let ord_hit1 = (38.889000, 121.529000);
+        let ord_hit2 = (38.890000, 121.530000);
+        let ord_miss1 = (38.905000, 121.545000);
+        let ord_miss2 = (38.906000, 121.546000);
+
+        let all_checkpoints = vec![must_pt, ord_hit1, ord_hit2, ord_miss1, ord_miss2];
+        let must_points = vec![must_pt];
+        let route = vec![must_pt, ord_hit1, ord_hit2];
+
+        let summary = map.draw_checkpoints(&painter, rect, &all_checkpoints, &must_points, &route);
+        assert_eq!(summary.must_total, 1);
+        assert_eq!(summary.must_passed, 1);
+        assert!(summary.all_must_passed(), "必经点应全部通过");
+        assert_eq!(summary.ord_total, 4);
+        assert_eq!(summary.ord_passed, 2);
+        assert_eq!(summary.skipped_ord(), 2, "应准确统计出未经过 2 个普通点");
     }
 }

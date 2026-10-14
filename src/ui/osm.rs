@@ -155,6 +155,16 @@ impl App {
             if self.config.custom_snap_road {
                 ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
             }
+            ui.separator();
+            mobile::drag_i64(
+                ui,
+                "osm_allowed_skip_ord",
+                &mut self.config.allowed_skip_ordinary,
+                0..=4,
+                0.2,
+                "允许跳过普通点: ",
+                " 个",
+            );
         });
 
         mobile::row(ui, |ui| {
@@ -411,7 +421,7 @@ impl App {
             need_sync = true;
         }
 
-        let (pts_bd, fences) = self.cached_points_and_fences();
+        let (pts_bd, fences, must_points) = self.cached_points_and_fences();
         if gen_playground {
             let fallback = if self.osm_page.map.center != (0.0, 0.0) {
                 self.osm_page.map.center
@@ -478,26 +488,40 @@ impl App {
             self.osm_page.preview = Some(plan);
         }
 
-        // 统计打卡点实际覆盖情况
-        let (passed_cp_cnt, total_cp_cnt, missing_cps) = if let Some(p) = &self.osm_page.preview {
-            let total = p.checkpoints.len();
-            let mut passed = 0usize;
+        // 统计打卡点实际覆盖情况（区分必经点与普通点）
+        let (summary, missing_cps) = if let Some(p) = &self.osm_page.preview {
+            let mut s = super::map::CheckpointSummary::default();
             let mut missing = Vec::new();
             for &(cla, clo) in &p.checkpoints {
+                let is_must = must_points
+                    .iter()
+                    .any(|&(mla, mlo)| (mla - cla).abs() < 1e-4 && (mlo - clo).abs() < 1e-4);
                 let hit = p.route.iter().any(|&(rla, rlo)| {
                     let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
                     let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
                     dx.hypot(dy) <= 20.0
                 });
-                if hit {
-                    passed += 1;
+                if is_must {
+                    s.must_total += 1;
+                    if hit {
+                        s.must_passed += 1;
+                    } else {
+                        s.missing_must.push((cla, clo));
+                        missing.push((cla, clo));
+                    }
                 } else {
-                    missing.push((cla, clo));
+                    s.ord_total += 1;
+                    if hit {
+                        s.ord_passed += 1;
+                    } else {
+                        s.missing_ord.push((cla, clo));
+                        missing.push((cla, clo));
+                    }
                 }
             }
-            (passed, total, missing)
+            (s, missing)
         } else {
-            (0, 0, Vec::new())
+            (super::map::CheckpointSummary::default(), Vec::new())
         };
 
         // ── 统计与图例栏 ─────────────────────────────────────────────
@@ -513,33 +537,65 @@ impl App {
                 ));
                 ui.separator();
             }
-            if total_cp_cnt > 0 {
-                if passed_cp_cnt >= total_cp_cnt {
+            if summary.must_total > 0 {
+                if summary.all_must_passed() {
                     ui.colored_label(
                         theme::ok(),
-                        format!("打卡点：已覆盖 {}/{} 个 √（全部达标）", passed_cp_cnt, total_cp_cnt),
+                        format!("必经点：{}/{} 全部覆盖 √", summary.must_passed, summary.must_total),
+                    );
+                } else {
+                    ui.colored_label(
+                        theme::err(),
+                        format!(
+                            "必经点：{}/{} ⚠（缺 {} 个，必导致未达标！）",
+                            summary.must_passed,
+                            summary.must_total,
+                            summary.must_total - summary.must_passed
+                        ),
+                    );
+                }
+                ui.separator();
+            }
+            if summary.ord_total > 0 {
+                let skipped = summary.skipped_ord();
+                if skipped == 0 {
+                    ui.colored_label(
+                        theme::ok(),
+                        format!("普通点：{}/{} 全部覆盖 √", summary.ord_passed, summary.ord_total),
+                    );
+                } else if (skipped as i64) <= self.config.allowed_skip_ordinary {
+                    ui.colored_label(
+                        theme::ok(),
+                        format!(
+                            "普通点：{}/{}（未经过 {} 个，在允许跳过的 {} 个内 √）",
+                            summary.ord_passed,
+                            summary.ord_total,
+                            skipped,
+                            self.config.allowed_skip_ordinary
+                        ),
                     );
                 } else {
                     ui.colored_label(
                         theme::warn(),
                         format!(
-                            "打卡点：已覆盖 {}/{} 个 ⚠（缺 {} 个可能未达标）",
-                            passed_cp_cnt,
-                            total_cp_cnt,
-                            total_cp_cnt - passed_cp_cnt
+                            "普通点：{}/{} ⚠（未经过 {} 个，超出允许跳过的 {} 个）",
+                            summary.ord_passed,
+                            summary.ord_total,
+                            skipped,
+                            self.config.allowed_skip_ordinary
                         ),
                     );
                     if ui
-                        .small_button("＋一键补齐未途经点")
-                        .on_hover_text("自动将尚未经过的打卡点插入路线末尾前，确保全部打卡达标")
+                        .small_button("＋一键补齐打卡点")
+                        .on_hover_text("自动将尚未经过的打卡点插入路线末尾前")
                         .clicked()
                     {
                         do_complete_cps = true;
                     }
                 }
                 ui.separator();
-            } else {
-                ui.label(format!("围栏：{} · 途经点：{}", fences.len(), self.config.custom_waypoints.len()));
+            } else if summary.must_total == 0 {
+                ui.label(format!("打卡点：{} · 围栏：{} · 途经点：{}", pts_bd.len(), fences.len(), self.config.custom_waypoints.len()));
             }
             if let Some(p) = &self.osm_page.preview {
                 if p.length_m > 0.0 {
@@ -687,10 +743,10 @@ impl App {
                     .map
                     .draw_polygon(&clipped, canvas, f, fence_color, 2.2);
             }
-            // 学校打卡点（已途经绿底带「√」标 / 未途经橙底带编号，悬停显示剩余米数）
+            // 学校打卡点（必经点「必」标红/绿 + 普通点「√」/「橙标」）
             self.osm_page
                 .map
-                .draw_checkpoints(&painter, canvas, &p.checkpoints, &p.route);
+                .draw_checkpoints(&painter, canvas, &p.checkpoints, &must_points, &p.route);
 
             // 规划路线（带方向箭头）
             if p.route.len() >= 2 {

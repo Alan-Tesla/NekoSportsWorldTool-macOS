@@ -113,9 +113,16 @@ pub struct Config {
     /// 跑圈出点模式：same | opposite | north | south | east | west。
     #[serde(default = "default_loop_exit")]
     pub loop_exit_mode: String,
+    /// 允许未经过的普通打卡点数量（学校 5 选 3 规则允许未过 2 个普通点，默认 2）。
+    #[serde(default = "default_allowed_skip")]
+    pub allowed_skip_ordinary: i64,
     /// 地图底图源：gaode | osm | vector。
     #[serde(default = "default_tile_source")]
     pub tile_source: String,
+}
+
+fn default_allowed_skip() -> i64 {
+    2
 }
 
 fn default_loop_perimeter() -> f64 {
@@ -198,6 +205,7 @@ impl Default for Config {
             loop_ccw: true,
             loop_entry_mode: default_loop_entry(),
             loop_exit_mode: default_loop_exit(),
+            allowed_skip_ordinary: default_allowed_skip(),
             tile_source: default_tile_source(),
         }
     }
@@ -532,4 +540,13 @@ pub fn save_fence_cache(fences: &[Vec<(f64, f64)>]) -> Result<(), String> {
         "fences": fences,
     });
     write_json("fence_cache.json", &doc)
+}
+
+/// 必经打卡点缓存：拉取策略成功后落盘，供地图与路径规划识别必经点。
+pub fn load_must_points_cache() -> Vec<(f64, f64)> {
+    read_json("must_points_cache.json").unwrap_or_default()
+}
+
+pub fn save_must_points_cache(must_points: &[(f64, f64)]) -> Result<(), String> {
+    write_json("must_points_cache.json", &must_points.to_vec())
 }

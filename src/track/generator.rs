@@ -125,7 +125,7 @@ fn build_from_ring(
     } else {
         rng.uniform(0.0, *arcs.last().unwrap_or(&400.0))
     };
-    let phase_v = rng.uniform(0.0, std::f64::consts::TAU);
+    let _phase_v = rng.uniform(0.0, std::f64::consts::TAU);
     let _phase_l = rng.uniform(0.0, std::f64::consts::TAU);
 
     let mut times = Vec::new();
@@ -139,51 +139,31 @@ fn build_from_ring(
         };
     }
     let n = times.len();
-
-    let base = (dist / dur_f).clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
-    let local_floor = (base * 0.78).max(SPEED_FLOOR);
-    let local_ceil = (base * 1.20).min(SPEED_CEIL).max(local_floor + 0.05);
-
-    // 真实学生体能分布曲线：
-    // 首公里轻快充沛（比均速快 15~20%，如实测 5'48" vs 平均 7'17"），中程平稳（6'45"），后程疲劳减速（8'05"~9'02"）
-    let n_dips = rng.choice(&[2, 3]);
-    let mut dips = Vec::new();
-    for _ in 0..n_dips {
-        dips.push((
-            rng.uniform(0.45, 0.92) * dur_f,
-            rng.uniform(18.0, 36.0),
-            rng.uniform(0.08, 0.18),
-        ));
-    }
-    let dip_factor = |t: f64| -> f64 {
-        let mut f = 1.0;
-        for &(c, hw, d) in &dips {
-            if (t - c).abs() < hw {
-                f *= 1.0 - d * 0.5 * (1.0 + (std::f64::consts::PI * (t - c) / hw).cos());
-            }
-        }
-        f
-    };
-
-    let mut w = Vec::with_capacity(n);
-    for &tt in &times {
-        let frac = (tt / dur_f).clamp(0.0, 1.0);
-        let pacing_curve = if frac < 0.28 {
-            1.19 - 0.11 * (frac / 0.28)
-        } else if frac < 0.60 {
-            1.08 - 0.10 * ((frac - 0.28) / 0.32)
-        } else {
-            0.98 - 0.20 * ((frac - 0.60) / 0.40)
-        };
-        let wave = 1.0
-            + 0.008 * (std::f64::consts::TAU * tt / 115.0 + phase_v).sin()
-            + 0.018 * (std::f64::consts::TAU * tt / 47.0 + phase_v * 2.3).sin();
-        let noise = 1.0 + rng.gauss(0.0, 0.006);
-        let target_v = base * pacing_curve * wave * noise * dip_factor(tt);
-        w.push(target_v.clamp(local_floor, local_ceil));
-    }
     let mut dts: Vec<f64> = (0..n - 1).map(|i| times[i + 1] - times[i]).collect();
     dts.push(1.0f64.max(dur_f - times[n - 1]));
+
+    let base = (dist / dur_f).clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
+    let local_floor = (base * 0.80).max(SPEED_FLOOR);
+    let local_ceil = (base * 1.20).min(SPEED_CEIL).max(local_floor + 0.05);
+
+    // 平稳自然的「前快后慢」体能曲线（参考真实学生跑步数据）：
+    //   - 前程体能充沛（比平均配速快 16~18%，如实测首公里 5'48" vs 平均 7'17"）；
+    //   - 中程平缓巡航过渡到平均配速；
+    //   - 后程渐进疲劳减速（比平均配速慢 16~18%，如实测后程 8'05"~9'02"）；
+    //   - 采用平滑三次 S 曲线 + 极微幅高斯微扰（消除上下剧烈颠簸跳动），曲线平稳自然。
+    let mut w = Vec::with_capacity(n);
+    let mut v = (base * 1.18).clamp(local_floor, local_ceil);
+    for i in 0..n {
+        let tt = times[i];
+        let dt = dts[i];
+        let u = (tt / dur_f).clamp(0.0, 1.0);
+        let s_curve = 3.0 * u * u - 2.0 * u * u * u;
+        let pacing_factor = 1.18 - 0.36 * s_curve;
+        let target_v = (base * pacing_factor).clamp(local_floor, local_ceil);
+        v = v + 0.12 * (target_v - v) * dt + rng.gauss(0.0, 0.008);
+        v = v.clamp(local_floor, local_ceil);
+        w.push(v);
+    }
 
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
     for _ in 0..n {

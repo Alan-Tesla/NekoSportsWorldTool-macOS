@@ -608,7 +608,7 @@ impl App {
         };
 
         let is_custom = mode == RouteMode::Custom;
-        let (pts_bd, fences) = self.cached_points_and_fences();
+        let (pts_bd, fences, _must) = self.cached_points_and_fences();
 
         // 自定义规划路径的内联控制栏
         if is_custom {
@@ -636,6 +636,15 @@ impl App {
                 if self.config.custom_snap_road && self.network.is_some() {
                     ui.checkbox(&mut self.config.custom_clip_fence, "围栏裁剪");
                 }
+                mobile::drag_i64(
+                    ui,
+                    "run_allowed_skip_ord",
+                    &mut self.config.allowed_skip_ordinary,
+                    0..=4,
+                    0.2,
+                    "跳过普通点: ",
+                    " 个",
+                );
                 egui::ComboBox::from_id_salt("run_custom_close_mode")
                     .width(180.0)
                     .selected_text(close_mode.label())
@@ -957,25 +966,41 @@ impl App {
             }
         }
 
-        let (passed_cp_cnt, total_cp_cnt, missing_cps) = if let Some(p) = &self.run_page.preview {
-            let total = p.checkpoints.len();
-            let mut passed = 0usize;
+        let (pts_bd, fences, must_points) = self.cached_points_and_fences();
+
+        let (summary, missing_cps) = if let Some(p) = &self.run_page.preview {
+            let mut s = super::map::CheckpointSummary::default();
             let mut missing = Vec::new();
             for &(cla, clo) in &p.checkpoints {
+                let is_must = must_points
+                    .iter()
+                    .any(|&(mla, mlo)| (mla - cla).abs() < 1e-4 && (mlo - clo).abs() < 1e-4);
                 let hit = p.route.iter().any(|&(rla, rlo)| {
                     let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
                     let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
                     dx.hypot(dy) <= 20.0
                 });
-                if hit {
-                    passed += 1;
+                if is_must {
+                    s.must_total += 1;
+                    if hit {
+                        s.must_passed += 1;
+                    } else {
+                        s.missing_must.push((cla, clo));
+                        missing.push((cla, clo));
+                    }
                 } else {
-                    missing.push((cla, clo));
+                    s.ord_total += 1;
+                    if hit {
+                        s.ord_passed += 1;
+                    } else {
+                        s.missing_ord.push((cla, clo));
+                        missing.push((cla, clo));
+                    }
                 }
             }
-            (passed, total, missing)
+            (s, missing)
         } else {
-            (0, 0, Vec::new())
+            (super::map::CheckpointSummary::default(), Vec::new())
         };
 
         if self.run_page.preview.is_some() {
@@ -997,21 +1022,53 @@ impl App {
                         }
                     });
                 ui.checkbox(&mut self.osm_page.show_road_overlay, "路网");
-                if total_cp_cnt > 0 {
+                if summary.must_total > 0 {
                     ui.separator();
-                    if passed_cp_cnt >= total_cp_cnt {
+                    if summary.all_must_passed() {
                         ui.colored_label(
                             theme::ok(),
-                            format!("打卡点：已覆盖 {}/{} 个 √", passed_cp_cnt, total_cp_cnt),
+                            format!("必经点：{}/{} 全部覆盖 √", summary.must_passed, summary.must_total),
+                        );
+                    } else {
+                        ui.colored_label(
+                            theme::err(),
+                            format!(
+                                "必经点：{}/{} ⚠（缺 {} 个，直接导致未达标！）",
+                                summary.must_passed,
+                                summary.must_total,
+                                summary.must_total - summary.must_passed
+                            ),
+                        );
+                    }
+                }
+                if summary.ord_total > 0 {
+                    ui.separator();
+                    let skipped = summary.skipped_ord();
+                    if skipped == 0 {
+                        ui.colored_label(
+                            theme::ok(),
+                            format!("普通点：{}/{} 全部覆盖 √", summary.ord_passed, summary.ord_total),
+                        );
+                    } else if (skipped as i64) <= self.config.allowed_skip_ordinary {
+                        ui.colored_label(
+                            theme::ok(),
+                            format!(
+                                "普通点：{}/{}（未经过 {} 个，在允许跳过的 {} 个内 √）",
+                                summary.ord_passed,
+                                summary.ord_total,
+                                skipped,
+                                self.config.allowed_skip_ordinary
+                            ),
                         );
                     } else {
                         ui.colored_label(
                             theme::warn(),
                             format!(
-                                "打卡点：已覆盖 {}/{} 个 ⚠（缺 {} 个）",
-                                passed_cp_cnt,
-                                total_cp_cnt,
-                                total_cp_cnt - passed_cp_cnt
+                                "普通点：{}/{} ⚠（未经过 {} 个，超出允许跳过的 {} 个）",
+                                summary.ord_passed,
+                                summary.ord_total,
+                                skipped,
+                                self.config.allowed_skip_ordinary
                             ),
                         );
                         if is_custom
@@ -1029,8 +1086,8 @@ impl App {
                     &[
                         ("可跑路网", egui::Color32::from_rgb(16, 135, 115)),
                         ("围栏", egui::Color32::from_rgb(180, 118, 0)),
-                        ("已途经打卡点(绿√)", egui::Color32::from_rgb(16, 185, 129)),
-                        ("未途经打卡点(橙标)", egui::Color32::from_rgb(245, 158, 11)),
+                        ("必经点(必标)", egui::Color32::from_rgb(220, 38, 38)),
+                        ("普通点(橙/绿)", egui::Color32::from_rgb(245, 158, 11)),
                         ("路线", egui::Color32::from_rgb(30, 111, 216)),
                         ("起点", egui::Color32::from_rgb(22, 160, 90)),
                         ("末点", egui::Color32::from_rgb(220, 38, 38)),
@@ -1120,10 +1177,10 @@ impl App {
                     .map
                     .draw_polygon(&clipped, canvas, f, fence_c, 2.0);
             }
-            // 学校打卡点（已途经绿底带「√」标 / 未途经橙底带编号，悬停显示剩余米数）
+            // 学校打卡点（必经点「必」标红/绿 + 普通点「√」/「橙标」）
             self.run_page
                 .map
-                .draw_checkpoints(&painter, canvas, &p.checkpoints, &p.route);
+                .draw_checkpoints(&painter, canvas, &p.checkpoints, &must_points, &p.route);
             let route_c = egui::Color32::from_rgb(30, 111, 216);
             if p.route.len() >= 2 {
                 self.run_page
@@ -1164,6 +1221,7 @@ impl App {
             }
 
             let close_mode_now = CustomCloseMode::from_str(&self.config.custom_close_mode);
+            let total_passed = summary.must_passed + summary.ord_passed;
             let label = if let Some(err) = &p.route_error {
                 err.clone()
             } else if p.length_m > 0.0 {
@@ -1172,7 +1230,7 @@ impl App {
                         "本次方案 {:.2} km · 开环总长 {:.0} m · 已途经打卡点 {}/{} · {} 途经点",
                         plan.dist,
                         p.length_m,
-                        passed_cp_cnt,
+                        total_passed,
                         p.checkpoints.len(),
                         self.config.custom_waypoints.len(),
                     )
@@ -1184,7 +1242,7 @@ impl App {
                             plan.dist,
                             p.length_m,
                             loops,
-                            passed_cp_cnt,
+                            total_passed,
                             p.checkpoints.len(),
                             if is_custom {
                                 format!(" · {} 途经点", self.config.custom_waypoints.len())
@@ -1197,7 +1255,7 @@ impl App {
                             "本次方案 {:.2} km · 路线 {:.0} m · 已途经打卡点 {}/{}{}",
                             plan.dist,
                             p.length_m,
-                            passed_cp_cnt,
+                            total_passed,
                             p.checkpoints.len(),
                             if is_custom {
                                 format!(" · {} 途经点", self.config.custom_waypoints.len())
@@ -1296,39 +1354,67 @@ impl App {
         let face_check = if self.run_page.face_check { 1 } else { 0 };
         let route_mode = self.run_page.route_mode;
 
-        // 自定义规划模式防漏打卡点拦截保护：检查是否所有打卡点都已覆盖
+        // 自定义规划模式防漏打卡点拦截保护：分级检查必经点与普通点
         if route_mode == RouteMode::Custom {
-            let (pts_bd, _) = self.cached_points_and_fences();
-            let total_cp = pts_bd.len();
-            if total_cp >= 2 {
+            let (pts_bd, _, must_points) = self.cached_points_and_fences();
+            if !pts_bd.is_empty() {
                 let route_pts = self
                     .run_page
                     .preview
                     .as_ref()
                     .map(|p| p.route.clone())
                     .unwrap_or_default();
-                let passed_cnt = pts_bd
-                    .iter()
-                    .filter(|&&(cla, clo)| {
-                        route_pts.iter().any(|&(rla, rlo)| {
-                            let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
-                            let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
-                            dx.hypot(dy) <= 20.0
-                        })
-                    })
-                    .count();
-                if passed_cnt < total_cp {
+                let mut must_total = 0usize;
+                let mut must_passed = 0usize;
+                let mut ord_total = 0usize;
+                let mut ord_passed = 0usize;
+                for &(cla, clo) in &pts_bd {
+                    let is_must = must_points
+                        .iter()
+                        .any(|&(mla, mlo)| (mla - cla).abs() < 1e-4 && (mlo - clo).abs() < 1e-4);
+                    let hit = route_pts.iter().any(|&(rla, rlo)| {
+                        let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
+                        let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
+                        dx.hypot(dy) <= 20.0
+                    });
+                    if is_must {
+                        must_total += 1;
+                        if hit {
+                            must_passed += 1;
+                        }
+                    } else {
+                        ord_total += 1;
+                        if hit {
+                            ord_passed += 1;
+                        }
+                    }
+                }
+                // 1. 必经点漏了：严重警告，绝对拦截！
+                if must_total > 0 && must_passed < must_total {
                     self.popup = Some(super::PopupInfo {
-                        title: "⚠ 打卡点未全部覆盖警告（未达标风险）".into(),
+                        title: "⚠ 必经打卡点未经过警告（直接导致未达标！）".into(),
                         lines: vec![
                             format!(
-                                "当前规划路线仅经过了 {}/{} 个打卡点，尚有 {} 个打卡点未覆盖！",
-                                passed_cnt,
-                                total_cp,
-                                total_cp - passed_cnt
+                                "当前规划路线未经过必经打卡点（尚缺 {} 个必经点）！",
+                                must_total - must_passed
                             ),
-                            "按运动世界校园规则，打卡点数量不足会被服务器直接判定为「未达标」。".into(),
-                            "建议：返回地图点击「＋一键补齐」，或手动微调途经点经过金色打卡点后再开始跑步。".into(),
+                            "按运动世界校园规则，必经打卡点必须全部打卡，未经过会被服务器直接判定为「未达标」。".into(),
+                            "建议：返回地图微调路线经过红色「必」字打卡点后再开始跑步。".into(),
+                        ],
+                    });
+                    return;
+                }
+                // 2. 普通点漏跑超出了设定的允许跳过数量：拦截提醒！
+                let skipped_ord = ord_total.saturating_sub(ord_passed);
+                if (skipped_ord as i64) > self.config.allowed_skip_ordinary {
+                    self.popup = Some(super::PopupInfo {
+                        title: "⚠ 普通打卡点跳过超出允许数量".into(),
+                        lines: vec![
+                            format!(
+                                "当前未经过 {} 个普通打卡点，超出了设定的允许跳过 {} 个！",
+                                skipped_ord, self.config.allowed_skip_ordinary
+                            ),
+                            "若确认你们学校规则允许跳过更多（如5选3），可在地图上方调大「跳过普通点」设置；或点击「＋一键补齐」补齐点位。".into(),
                         ],
                     });
                     return;

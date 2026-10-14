@@ -17,51 +17,52 @@ use serde_json::{json, Map, Value};
 
 pub const RECORD_PATH: &str = "/api/v70260/runnings/save/record";
 
-/// Android 10s 窗（id 种子 60000）。
+/// Android 10s 窗（直接使用 Track 已平滑归一化的 10 秒时间窗，彻底消除采样抽样导致的 dist=0.0 假性暂停与 72'00" 红线）。
 fn android_tensec(track: &Track, start_ms: i64, kind: &str) -> Vec<Value> {
-    let locs = &track.locations;
-    let total_time = track.totalTime;
-    let mut out = Vec::new();
     let rid_seed = 60000i64;
-    let mut w = 10i64;
-    while w <= total_time {
-        let lo = w - 10;
-        let hi = w.min(total_time);
-        let mut d_lo = 0.0f64;
-        let mut s_lo = 0i64;
-        let mut d_hi = 0.0f64;
-        let mut s_hi = 0i64;
-        for p in locs {
-            let tt = p.totalTime;
-            if tt <= lo {
-                d_lo = p.totalDis;
-                s_lo = p.steps;
-            }
-            if tt <= hi {
-                d_hi = p.totalDis;
-                s_hi = p.steps;
-            }
-        }
-        let dist = round_to((d_hi - d_lo).max(0.0), 4);
-        let steps_n = (s_hi - s_lo).max(0);
-        let begin = start_ms + lo * 1000;
-        let end = start_ms + hi * 1000;
-        let qn = w / 10 - 1;
-        if kind == "speed" {
-            out.push(json!({
-                "beginTime": begin, "distance": dist, "endTime": end,
-                "flag": start_ms, "id": rid_seed + qn, "queueNum": qn, "state": 0,
-            }));
-        } else {
-            out.push(json!({
-                "avgDiff": 0.0, "beginTime": begin, "endTime": end,
-                "flag": start_ms, "id": rid_seed + qn, "maxDiff": 0.0,
-                "minDiff": 1000.0, "queueNum": qn, "state": 0, "stepsNum": steps_n,
-            }));
-        }
-        w += 10;
+    let total_time = track.totalTime;
+    if kind == "speed" {
+        track
+            .speedPerTenSec
+            .iter()
+            .enumerate()
+            .map(|(qn, win)| {
+                let lo = (qn as i64) * 10;
+                let hi = ((qn as i64) * 10 + win.time).min(total_time);
+                json!({
+                    "beginTime": start_ms + lo * 1000,
+                    "distance": win.value,
+                    "endTime": start_ms + hi * 1000,
+                    "flag": start_ms,
+                    "id": rid_seed + qn as i64,
+                    "queueNum": qn as i64,
+                    "state": 0,
+                })
+            })
+            .collect()
+    } else {
+        track
+            .stepsPerTenSec
+            .iter()
+            .enumerate()
+            .map(|(qn, win)| {
+                let lo = (qn as i64) * 10;
+                let hi = ((qn as i64) * 10 + win.time).min(total_time);
+                json!({
+                    "avgDiff": 0.0,
+                    "beginTime": start_ms + lo * 1000,
+                    "endTime": start_ms + hi * 1000,
+                    "flag": start_ms,
+                    "id": rid_seed + qn as i64,
+                    "maxDiff": 0.0,
+                    "minDiff": 1000.0,
+                    "queueNum": qn as i64,
+                    "state": 0,
+                    "stepsNum": win.value as i64,
+                })
+            })
+            .collect()
     }
-    out
 }
 
 /// bdA 正差分累计。

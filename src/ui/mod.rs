@@ -436,8 +436,14 @@ impl App {
         }
     }
 
-    /// 读取当前定位锚点对应的缓存打卡点（BD-09）与电子围栏（BD-09）。
-    pub fn cached_points_and_fences(&self) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
+    /// 读取当前定位锚点对应的缓存打卡点（BD-09）、电子围栏（BD-09）与必经点列表（BD-09）。
+    pub fn cached_points_and_fences(
+        &self,
+    ) -> (
+        Vec<(f64, f64)>,
+        Vec<Vec<(f64, f64)>>,
+        Vec<(f64, f64)>,
+    ) {
         let pts_bd = self
             .identity
             .anchor_coordinate()
@@ -446,7 +452,8 @@ impl App {
             .map(|(_ts, pts)| crate::api::points::points_bd(&pts))
             .unwrap_or_default();
         let fences = crate::api::model::load_fence_cache().unwrap_or_default();
-        (pts_bd, fences)
+        let must_points = crate::api::model::load_must_points_cache();
+        (pts_bd, fences, must_points)
     }
 
     /// 持久化自定义路径规划配置，并标记跑步页与路网页预览需重算。
