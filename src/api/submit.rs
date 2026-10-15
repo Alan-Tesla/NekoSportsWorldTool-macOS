@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 
 pub const RECORD_PATH: &str = "/api/v70260/runnings/save/record";
 
-/// Android 10s 窗（直接使用 Track 已平滑归一化的 10 秒时间窗，彻底消除采样抽样导致的 dist=0.0 假性暂停与 72'00" 红线）。
+/// Android 10s 窗：直接导出统一重建后的实际距离、步数和时长，末窗允许不足10秒。
 fn android_tensec(track: &Track, start_ms: i64, kind: &str) -> Vec<Value> {
     let rid_seed = 60000i64;
     let total_time = track.totalTime;

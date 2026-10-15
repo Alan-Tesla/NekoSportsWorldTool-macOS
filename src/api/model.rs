@@ -173,7 +173,7 @@ fn default_ai_reps() -> i64 {
     5
 }
 fn default_update_check() -> String {
-    "silent".into()
+    if cfg!(target_os = "macos") { "off".into() } else { "silent".into() }
 }
 
 impl Default for Config {
@@ -224,7 +224,9 @@ fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
 }
 
 fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
-    let path = exe_dir().join(name);
+    let directory = exe_dir();
+    std::fs::create_dir_all(&directory).map_err(|e| format!("创建数据目录失败: {e}"))?;
+    let path = directory.join(name);
     let json =
         serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
     std::fs::write(&path, json).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
