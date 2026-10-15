@@ -60,7 +60,7 @@ pub fn fatigue_from_km(km: f64) -> f64 {
     }
 }
 
-/// 步频 OU 耦合：在目标步频序列上做均值回归随机波动，并模拟手机在口袋/手中的真实颠簸瞬时峰值（最高可达 300~320 spm）与减速低点（70~120 spm）。
+/// 步频 OU 耦合：围绕可配置目标连续波动，不人为注入手机传感器误检尖峰。
 pub fn ou_cadence_series(
     targets: &[f64],
     dts: &[f64],
@@ -80,17 +80,11 @@ pub fn ou_cadence_series(
     let mut c = targets.first().copied().unwrap_or(185.0);
     for i in 0..targets.len() {
         let dt = dts[i];
-        c = c + theta * (targets[i] - c) * dt + sigma * dt.sqrt() * normal.sample(&mut rng);
-        // 模拟偶发的手机握持摆臂/口袋颠簸瞬时统计峰值（实测最大 320 spm）
-        let u: f64 = rand::Rng::gen_range(&mut rng, 0.0..1.0);
-        let sample_val = if u < 0.015 {
-            rand::Rng::gen_range(&mut rng, 260.0..=320.0)
-        } else if u < 0.030 {
-            rand::Rng::gen_range(&mut rng, 72.0..=125.0)
-        } else {
-            c.clamp(floor, ceil)
-        };
-        out.push(sample_val);
+        let rate = theta.max(1e-6);
+        let decay = (-rate*dt).exp();
+        let noise_sd = sigma*((1.0-decay*decay)/(2.0*rate)).sqrt();
+        c = targets[i]+(c-targets[i])*decay+noise_sd*normal.sample(&mut rng);
+        out.push(c.clamp(floor, ceil));
     }
     out
 }
@@ -119,6 +113,7 @@ mod tests {
         let dts = vec![5.0; n];
         let cad = ou_cadence_series(&targets, &dts, 42, 0.25, 1.8, 160.0, 205.0);
         assert_eq!(cad.len(), n);
+        assert!(cad.iter().all(|c| (160.0..=205.0).contains(c)));
         let avg_cad = cad.iter().sum::<f64>() / n as f64;
         assert!(
             (180.0..=190.0).contains(&avg_cad),

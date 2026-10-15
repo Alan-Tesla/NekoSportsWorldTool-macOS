@@ -19,7 +19,7 @@ pub struct KinParams {
     pub brake_max: f64,
     /// 弯道预判前瞻距离（米）。
     pub lookahead_m: f64,
-    /// 热身时长（秒），起点从 0.85× 匀速 ramp 到 1.0×。
+    /// 热身时长（秒），起点从 0.90× 匀速 ramp 到 1.0×。
     pub warmup_s: f64,
     /// OU 均值回归速率 θ（越小越持久）。
     pub theta: f64,
@@ -33,11 +33,25 @@ impl Default for KinParams {
             a_c_max: 2.5,
             brake_max: 1.5,
             lookahead_m: 40.0,
-            warmup_s: 20.0,
-            theta: 0.12,
-            sigma: 0.06,
+            warmup_s: 30.0,
+            theta: 0.04,
+            sigma: 0.008,
         }
     }
+}
+
+/// Illustrative pacing profile, not an observation of any particular runner.
+/// Cruise steadily after warmup; introduce gradual fatigue only after 40% elapsed.
+/// The final target speed is 7% below cruising speed, without abrupt phase changes.
+pub fn steady_pacing_factor(elapsed: f64, duration: f64, warmup: f64) -> f64 {
+    let u = (elapsed / duration.max(1.0)).clamp(0.0, 1.0);
+    let warm = if warmup > 0.0 {
+        let t = (elapsed / warmup).clamp(0.0, 1.0);
+        0.90 + 0.10 * t * t * (3.0 - 2.0 * t)
+    } else { 1.0 };
+    let t = ((u - 0.40) / 0.60).clamp(0.0, 1.0);
+    let fatigue = t * t * (3.0 - 2.0 * t);
+    warm * (1.0 - 0.07 * fatigue)
 }
 
 /// 从弧长 s 出发，在 lookahead 范围内取最小的「可刹停速度」。
@@ -92,23 +106,15 @@ pub fn pace_profile(
     let normal = Normal::<f64>::new(0.0, 1.0).unwrap();
     let total_time_est: f64 = dts.iter().sum::<f64>().max(1.0);
 
-    // ① 平稳自然的「前快后慢」体能曲线（参考真实学生跑步数据）：
-    //   - 起程体能充沛（比平均配速快 6%~7%，如 7'17" 均速起步约 6'48"）；
-    //   - 中程平缓巡航自然过渡到平均配速（7'17"）；
-    //   - 后程渐进疲劳平滑减速（比平均配速慢 6%~7%，后程约 7'50"）；
-    //   - 采用平滑三次 S 曲线 + 微幅平滑扰动（消除折线图大幅剧烈跳变与锯齿，保持自然微波带）。
     let mut w = Vec::with_capacity(n);
-    let mut v = v0 * 1.07;
+    let mut v = v0*steady_pacing_factor(0.0,total_time_est,p.warmup_s);
     let mut t = 0.0;
     for &dt in dts {
-        let u = (t / total_time_est).clamp(0.0, 1.0);
-        // S 形平滑过渡因子：从 u=0 时的 1.07 渐变到 u=1 时的 0.93，积分均值严格为 1.00
-        let s_curve = 3.0 * u * u - 2.0 * u * u * u;
-        let pacing_factor = 1.07 - 0.14 * s_curve;
-        let target_v = (v0 * pacing_factor).clamp(floor, ceil);
-        // 自然平缓的步频/体能微波动（每步标准差微幅控制在 0.005，彻底消除上下大幅震荡）
-        v = v + 0.10 * (target_v - v) * dt + 0.005 * dt.sqrt() * normal.sample(&mut rng);
-        v = v.clamp(floor, ceil);
+        let target_v = (v0*steady_pacing_factor(t,total_time_est,p.warmup_s)).clamp(floor,ceil);
+        let theta = p.theta.max(1e-6);
+        let decay = (-theta*dt).exp();
+        let noise_sd = p.sigma*((1.0-decay*decay)/(2.0*theta)).sqrt();
+        v = (target_v+(v-target_v)*decay+noise_sd*normal.sample(&mut rng)).clamp(floor,ceil);
         w.push(v);
         t += dt;
     }
@@ -121,16 +127,10 @@ pub fn pace_profile(
         s += w[i] * dts[i];
     }
 
-    // ③ 弯道柔和限速 cap（人在 2~3m/s 跑步时，弯道仅微调步幅，最多减速 3%~5%，绝不下砸到步行）
-    let turn_floor = (v0 * 0.95).max(floor);
+    // ③ 弯道预判限速 cap（钳到有效窗口内）
     let mut caps = Vec::with_capacity(n);
     for i in 0..n {
-        let raw_cap = speed_limit_ahead(route, s_of[i], p);
-        let cap = if raw_cap.is_finite() {
-            raw_cap.max(turn_floor).min(ceil)
-        } else {
-            ceil
-        };
+        let cap = speed_limit_ahead(route, s_of[i], p).clamp(floor, ceil);
         w[i] = w[i].min(cap);
         caps.push(cap);
     }
