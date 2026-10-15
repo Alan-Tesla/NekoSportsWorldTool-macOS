@@ -38,3 +38,17 @@ docs/_preview.png
 # 自动更新替换残留
 *.exe.old
 *.exe.new
+
+# Local runtime data and credentials (all directories)
+**/NekoSportsWorldTool-data/
+**/config.json
+**/session.json
+**/identity.json
+**/points_cache.json
+**/semester_result.json
+**/rank_result.json
+.env
+.env.*
+*.log
+*.app/
+.DS_Store
