@@ -75,6 +75,56 @@ pub struct Track {
 }
 
 impl Track {
+    /// Derive all summaries from the final cumulative samples, including short tail windows.
+    pub fn rebuild_statistics(&mut self) {
+        let Some(last) = self.locations.last() else { return };
+        self.totalTime = last.totalTime;
+        self.validTime = last.validTime;
+        self.totalDistance = last.totalDis;
+        self.validDistance = last.validDis;
+        self.totalSteps = last.steps;
+        let mut previous = (0, 0.0);
+        for point in &mut self.locations {
+            let dt = point.totalTime - previous.0;
+            point.avgSpeed = if dt > 0 { (point.totalDis - previous.1) / dt as f64 } else { 0.0 };
+            previous = (point.totalTime, point.totalDis);
+        }
+        self.speedPerTenSec.clear();
+        self.stepsPerTenSec.clear();
+        self.segments.clear();
+        for begin in (0..self.totalTime).step_by(10) {
+            let end = (begin + 10).min(self.totalTime);
+            let (d0, s0) = self.cumulative_at(begin);
+            let (d1, s1) = self.cumulative_at(end);
+            self.speedPerTenSec.push(TenWindow { time: end-begin, value: d1-d0 });
+            self.stepsPerTenSec.push(TenWindow { time: end-begin, value: s1-s0 });
+        }
+        for begin in (0..self.totalTime).step_by(60) {
+            let end = (begin + 60).min(self.totalTime);
+            let (d0, s0) = self.cumulative_at(begin);
+            let (d1, s1) = self.cumulative_at(end);
+            let duration = end-begin;
+            self.segments.push(Segment {
+                totalTime: duration, distance: (d1.round()-d0.round()) as i64,
+                startTime: begin*1000, endTime: end*1000,
+                avgSpeed: (d1-d0)/duration as f64,
+                avgStep: ((s1-s0)*60.0/duration as f64).round() as i64, state: 0,
+            });
+        }
+    }
+
+    fn cumulative_at(&self, time: i64) -> (f64, f64) {
+        let i = self.locations.partition_point(|point| point.totalTime <= time);
+        if i == 0 { return (0.0, 0.0) }
+        let a = &self.locations[i-1];
+        let Some(b) = self.locations.get(i) else { return (a.totalDis, a.steps as f64) };
+        let dt = b.totalTime-a.totalTime;
+        if dt <= 0 { return (a.totalDis, a.steps as f64) }
+        let t = (time-a.totalTime) as f64/dt as f64;
+        (a.totalDis+(b.totalDis-a.totalDis)*t,
+         (a.steps as f64+(b.steps-a.steps) as f64*t).round())
+    }
+
     /// 记录顶层坐标唯一从轨迹首点派生，避免调用方重复传入另一套坐标。
     pub fn start_coordinate(&self) -> Result<Coordinate, String> {
         let first = self.locations.first().ok_or("轨迹不能为空".to_string())?;
@@ -85,8 +135,24 @@ impl Track {
     }
 
     pub fn validate_consistency(&self) -> Result<Coordinate, String> {
-        if self.totalTime <= 0 || self.totalDistance <= 0.0 { return Err("轨迹时长和距离必须为正数".into()); }
-        for point in &self.locations { Coordinate::new(point.gLat, point.gLng, point.accuracy)?; }
+        if self.totalTime <= 0 || !self.totalDistance.is_finite() || self.totalDistance <= 0.0 { return Err("轨迹时长和距离必须为有限正数".into()); }
+        let mut previous = (0, 0.0, 0);
+        for point in &self.locations {
+            Coordinate::new(point.gLat, point.gLng, point.accuracy)?;
+            if !point.totalDis.is_finite() || !point.avgSpeed.is_finite() ||
+                point.totalTime < previous.0 || point.totalDis < previous.1 || point.steps < previous.2 {
+                return Err("轨迹累计时间、距离或步数无效或发生倒退".into());
+            }
+            if point.gainTimeMs != self.startTime + point.totalTime*1000 {
+                return Err("轨迹时间戳与累计用时不一致".into());
+            }
+            previous = (point.totalTime, point.totalDis, point.steps);
+        }
+        if let Some(last) = self.locations.last() {
+            if last.totalTime != self.totalTime || (last.totalDis-self.totalDistance).abs() > 0.001 || last.steps != self.totalSteps {
+                return Err("轨迹末点与汇总的时间、距离或步数不一致".into());
+            }
+        }
         self.start_coordinate()
     }
 }
@@ -95,7 +161,7 @@ impl Track {
 mod tests {
     use super::*;
     fn sample_track() -> Track {
-        let point = GenPoint { id: 1, flag: 1, lat: -1.0, lng: -1.0, gLat: 39.9, gLng: 116.4, speed: 1.0, avgSpeed: 1.0, radius: 3.0, accuracy: 3.0, ptype: 0, locType: 1, hasAltitude: true, totalTime: 1, totalDis: 1.0, validDis: 1.0, validTime: 1, steps: 1, stepDistance: 0.0, gainTime: String::new(), gainTimeMs: 1, queueNum: 0, coorType: "gcj02".into(), bdA: 1.0, bdD: 0.0, bdS: 1.0, bdG: 1, count: 1, dtr: 0.0, state: 0, locationId: String::new() };
+        let point = GenPoint { id: 1, flag: 1, lat: -1.0, lng: -1.0, gLat: 39.9, gLng: 116.4, speed: 1.0, avgSpeed: 1.0, radius: 3.0, accuracy: 3.0, ptype: 0, locType: 1, hasAltitude: true, totalTime: 1, totalDis: 1.0, validDis: 1.0, validTime: 1, steps: 1, stepDistance: 0.0, gainTime: String::new(), gainTimeMs: 1001, queueNum: 0, coorType: "gcj02".into(), bdA: 1.0, bdD: 0.0, bdS: 1.0, bdG: 1, count: 1, dtr: 0.0, state: 0, locationId: String::new() };
         Track { totalTime: 1, totalDistance: 1.0, validDistance: 1.0, validTime: 1, startTime: 1, startLatitude: 39.9, startLongitude: 116.4, locations: vec![point], totalSteps: 1, speedPerTenSec: vec![], stepsPerTenSec: vec![], segments: vec![] }
     }
     #[test] fn top_level_coordinate_is_derived_from_first_point() { assert!(sample_track().validate_consistency().is_ok()); let mut invalid = sample_track(); invalid.startLatitude = 38.9; assert!(invalid.validate_consistency().is_err()); }

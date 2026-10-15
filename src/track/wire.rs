@@ -78,8 +78,8 @@ pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
 pub fn track_passes_bd(track: &Track, bd_lat: f64, bd_lon: f64, radius_m: f64) -> bool {
     let r2 = radius_m * radius_m;
     track.locations.iter().any(|loc| {
-        let dlat = (loc.gLat - bd_lat) * super::geom::MET_PER_DEG_LAT;
-        let dlon = (loc.gLng - bd_lon) * super::geom::MET_PER_DEG_LNG;
+        let dlat = (loc.gLat - bd_lat) * super::geom::meters_per_degree_lat(bd_lat);
+        let dlon = (loc.gLng - bd_lon) * super::geom::meters_per_degree_lng(bd_lat);
         dlat * dlat + dlon * dlon <= r2
     })
 }
@@ -193,7 +193,7 @@ mod validation_tests {
     }
 
     #[test]
-    fn five_points_only_mark_actually_visited_checkpoints_and_keep_pace_in_4_to_10_min() {
+    fn five_points_only_mark_visited_checkpoints_and_preserve_measured_speed() {
         let visited_pt = (38.901678, 121.540241);
         let next_pt = (38.906000, 121.540241);
         let unvisited_pt = (38.920000, 121.560000); // 距离路线 > 2km，不应被算作已打卡
@@ -217,27 +217,16 @@ mod validation_tests {
         assert_eq!(payload[0]["isPass"], json!(true), "经过的打卡点应为 isPass=true");
         assert_eq!(payload[1]["isPass"], json!(false), "未经过的打卡点不应被算作 isPass=true");
 
-        // 2. 验证配速严格保持在 4~10 分配速（1.66~4.17 m/s）内，无突然飙升
-        for loc in track.locations.iter().skip(2) {
-            if loc.ptype != -1 && loc.ptype != 6 && loc.avgSpeed > 0.0 {
-                assert!(
-                    loc.avgSpeed >= crate::track::generator::SPEED_FLOOR - 0.05
-                        && loc.avgSpeed <= crate::track::generator::SPEED_CEIL + 0.05,
-                    "瞬时速度 {} m/s 越出 4~10 分配速窗口",
-                    loc.avgSpeed
-                );
+        // Startup and short final windows may be slower: summaries must conserve data.
+        for pair in track.locations.windows(2) {
+            let dt = pair[1].totalTime-pair[0].totalTime;
+            if dt > 0 {
+                let measured = (pair[1].totalDis-pair[0].totalDis)/dt as f64;
+                assert!((pair[1].avgSpeed-measured).abs()<1e-6);
             }
         }
+        assert!((track.speedPerTenSec.iter().map(|w| w.value).sum::<f64>()-track.totalDistance).abs()<1e-6);
 
-        // 3. 验证每个 10 秒时间窗位移严格在 17.50~41.00 米之间，绝不下坠跌破 10'00"（绝不标红！）
-        assert!(!track.speedPerTenSec.is_empty(), "10秒配速窗不能为空");
-        for win in &track.speedPerTenSec {
-            assert!(
-                win.value >= 17.50 && win.value <= 41.00,
-                "10秒时间窗位移 {} m 跌出 17.50~41.00m 安全区间（配速会标红）",
-                win.value
-            );
-        }
     }
 }
 
@@ -301,11 +290,11 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
             let lap_steps = pt.steps - prev_steps;
             laps.push(json!({
                 "avgCadence": round_to(
-                    (lap_steps as f64 / (lap_t as f64 / 60.0)).clamp(160.0, 210.0),
+                    lap_steps as f64 / (lap_t as f64 / 60.0),
                     2,
                 ),
                 "avgPace": round_to(
-                    ((lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001)).clamp(4.05, 9.60),
+                    (lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001),
                     2,
                 ),
                 "avgStride": round_to(lap_d / 1.max(lap_steps) as f64 * 100.0, 2),

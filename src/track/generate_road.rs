@@ -11,9 +11,9 @@
 use super::generator::{fit_speeds_bounded, SPEED_CEIL, SPEED_FLOOR};
 use super::geom::{
     fmt_gain_time, make_ordered_path, open_point_at, ring_point_at, round_to, to_bd,
-    wgs84_to_bd09, Rng, MET_PER_DEG_LAT, MET_PER_DEG_LNG,
+    wgs84_to_bd09, Rng, meters_per_degree_lat, meters_per_degree_lng,
 };
-use super::model::{GenPoint, Segment, TenWindow, Track};
+use super::model::{GenPoint, Track};
 use super::postfix::apply_post_fixes;
 pub use route_planner::CustomCloseMode;
 use route_planner::{
@@ -339,10 +339,10 @@ pub fn append_playground_laps(
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                let da = ((a.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
-                    + ((a.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
-                let db = ((b.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
-                    + ((b.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
+                let da = ((a.0 - prev.0) * meters_per_degree_lat(prev.0)).powi(2)
+                    + ((a.1 - prev.1) * meters_per_degree_lng(prev.0)).powi(2);
+                let db = ((b.0 - prev.0) * meters_per_degree_lat(prev.0)).powi(2)
+                    + ((b.1 - prev.1) * meters_per_degree_lng(prev.0)).powi(2);
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(idx, _)| idx)
@@ -377,8 +377,8 @@ pub fn repeat_last_loop(waypoints: &mut Vec<(f64, f64)>) -> bool {
     for back in 3..=max_back {
         let idx = n - 1 - back;
         let p = waypoints[idx];
-        let d2 = ((p.0 - last.0) * MET_PER_DEG_LAT).powi(2)
-            + ((p.1 - last.1) * MET_PER_DEG_LNG).powi(2);
+        let d2 = ((p.0 - last.0) * meters_per_degree_lat(last.0)).powi(2)
+            + ((p.1 - last.1) * meters_per_degree_lng(last.0)).powi(2);
         if d2 < best_d {
             best_d = d2;
             loop_start = Some(idx);
@@ -592,10 +592,10 @@ pub fn generate_parametric_loop_points(
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
-                        let da = ((a.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
-                            + ((a.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
-                        let db = ((b.0 - prev.0) * MET_PER_DEG_LAT).powi(2)
-                            + ((b.1 - prev.1) * MET_PER_DEG_LNG).powi(2);
+                        let da = ((a.0 - prev.0) * meters_per_degree_lat(prev.0)).powi(2)
+                            + ((a.1 - prev.1) * meters_per_degree_lng(prev.0)).powi(2);
+                        let db = ((b.0 - prev.0) * meters_per_degree_lat(prev.0)).powi(2)
+                            + ((b.1 - prev.1) * meters_per_degree_lng(prev.0)).powi(2);
                         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .map(|(idx, _)| idx)
@@ -718,8 +718,8 @@ pub fn make_playground_oval(
             let a = existing_wps[0];
             let b = existing_wps[1];
             let mid = ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
-            let dx = (b.1 - a.1) * MET_PER_DEG_LNG;
-            let dy = (b.0 - a.0) * MET_PER_DEG_LAT;
+            let dx = (b.1 - a.1) * meters_per_degree_lng(mid.0);
+            let dy = (b.0 - a.0) * meters_per_degree_lat(mid.0);
             let ang = if dx.hypot(dy) > 5.0 {
                 dy.atan2(dx)
             } else {
@@ -874,8 +874,8 @@ fn route_ring(route: &Route, c_lat: f64, c_lng: f64) -> (Vec<(f64, f64)>, Vec<f6
         .iter()
         .map(|p| {
             (
-                (p.lon - c_lng) * MET_PER_DEG_LNG,
-                (p.lat - c_lat) * MET_PER_DEG_LAT,
+                (p.lon - c_lng) * meters_per_degree_lng(c_lat),
+                (p.lat - c_lat) * meters_per_degree_lat(c_lat),
             )
         })
         .collect();
@@ -997,8 +997,8 @@ fn build_track_from_route(
         ..Default::default()
     };
     let base_v = avg_v.clamp(SPEED_FLOOR + 0.05, SPEED_CEIL - 0.05);
-    let local_floor = (base_v * 0.90).max(SPEED_FLOOR);
-    let local_ceil = (base_v * 1.10).min(SPEED_CEIL).max(local_floor + 0.05);
+    let local_floor = (base_v * 0.80).max(SPEED_FLOOR);
+    let local_ceil = (base_v * 1.18).min(SPEED_CEIL).max(local_floor + 0.05);
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut w = pace_profile(
         route,
@@ -1035,7 +1035,6 @@ fn build_track_from_route(
         fit_speeds_bounded(&mut w, &dts, dist, SPEED_FLOOR, SPEED_CEIL);
     }
     let disp_of: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
-    let seg_dist: Vec<f64> = disp_of.clone();
     let speeds: Vec<f64> = (0..n)
         .map(|i| if w[i] > 0.0 { w[i] } else { base_v })
         .collect();
@@ -1045,8 +1044,8 @@ fn build_track_from_route(
         &net.buildings,
         |c| {
             [
-                (c.lon - c_lng) * MET_PER_DEG_LNG,
-                (c.lat - c_lat) * MET_PER_DEG_LAT,
+                (c.lon - c_lng) * meters_per_degree_lng(c_lat),
+                (c.lat - c_lat) * meters_per_degree_lat(c_lat),
             ]
         },
         2.0,
@@ -1074,12 +1073,6 @@ fn build_track_from_route(
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
     let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
-    let mut ten_t = 0.0f64;
-    let mut ten_d = 0.0f64;
-    let mut ten_st = 0.0f64;
-    let mut ten_speed: Vec<TenWindow> = Vec::new();
-    let mut ten_steps: Vec<TenWindow> = Vec::new();
-
     for i in 0..n {
         let dt = dts[i];
         let (typ, lt) = kinds[i];
@@ -1116,8 +1109,11 @@ fn build_track_from_route(
             },
             2,
         );
-        // 全程纯绿连续运动状态：state=1（绝不注入 state=2 静止标签，防止 App 误判为中途暂停）
-        let state = 1;
+        let state = if typ == 0 {
+            rng.weighted(&[(1, 145), (2, 45), (3, 164)])
+        } else {
+            rng.weighted(&[(1, 145), (2, 256), (3, 151)])
+        };
         dist_acc += d_step;
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
         alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
@@ -1125,13 +1121,13 @@ fn build_track_from_route(
         let v_now = speeds[i];
         let stride = (v_now * 60.0 / cadences[i]).clamp(0.32, 1.25);
         let cad = v_now * 60.0 / stride;
-        steps_acc += cad / 60.0 * dt;
+        if d_step > 0.0 { steps_acc += cad / 60.0 * dt; }
         let nxt = pos(s + 2.0);
         let brg =
             ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
-        let avg_sp = round_to((d_step / dt.max(0.1)).clamp(SPEED_FLOOR, SPEED_CEIL), 4);
+        let avg_sp = round_to(d_step / dt.max(0.1), 4);
         let kmh = avg_sp * 3.6;
-        let sigma = (kmh * 0.06).max(0.05);
+        let sigma = (kmh * 0.015).max(0.02);
         let gps_speed = if i <= 1 {
             0.0
         } else {
@@ -1141,27 +1137,6 @@ fn build_track_from_route(
             )
         };
 
-        ten_t += dt;
-        ten_d += speeds[i] * dt;
-        ten_st += cad / 60.0 * dt;
-        while ten_t >= 10.0 {
-            let k = 10.0 / ten_t;
-            let raw_d = ten_d * k;
-            let raw_st = ten_st * k;
-            let out_d = raw_d.clamp(17.50, 41.00);
-            let out_st = raw_st.clamp(25.0, 45.0);
-            ten_speed.push(TenWindow {
-                time: 10,
-                value: round_to(out_d, 2),
-            });
-            ten_steps.push(TenWindow {
-                time: 10,
-                value: round_to(out_st, 0),
-            });
-            ten_t -= 10.0;
-            ten_d -= raw_d;
-            ten_st -= raw_st;
-        }
         locs.push(GenPoint {
             id: i as i64 + 1,
             flag: start_ms,
@@ -1196,59 +1171,16 @@ fn build_track_from_route(
             locationId: String::new(),
         });
     }
-    if ten_t > 0.5 {
-        let k = 10.0 / ten_t;
-        let out_d = (ten_d * k).clamp(17.50, 41.00);
-        let out_st = (ten_st * k).clamp(25.0, 45.0);
-        ten_speed.push(TenWindow {
-            time: 10,
-            value: round_to(out_d, 2),
-        });
-        ten_steps.push(TenWindow {
-            time: 10,
-            value: round_to(out_st, 0),
-        });
-    }
-    // 消除离散时间窗锯齿与大幅跳变，生成平稳连续、符合自然生理律动的 10 秒配速曲线
-    super::generator::smooth_ten_sec_windows(dur, dist, seed, &mut ten_speed, &mut ten_steps);
-
-    let mut segments: Vec<Segment> = Vec::new();
-    let (mut seg_t, mut seg_d) = (0.0f64, 0.0f64);
-    let mut seg_v: Vec<f64> = Vec::new();
-    for i in 0..n {
-        seg_t += dts[i];
-        seg_d += seg_dist[i];
-        seg_v.push(speeds[i]);
-        if seg_t >= 60.0 || i == n - 1 {
-            segments.push(Segment {
-                totalTime: round_to(seg_t, 0) as i64,
-                distance: round_to(seg_d, 0) as i64,
-                startTime: round_to((times[i] - seg_t) * 1000.0, 0) as i64,
-                endTime: round_to(times[i] * 1000.0, 0) as i64,
-                avgSpeed: round_to(seg_v.iter().sum::<f64>() / seg_v.len() as f64, 3),
-                avgStep: round_to(steps_acc / 1.0f64.max(t_acc) * 60.0, 0) as i64,
-                state: 0,
-            });
-            seg_t = 0.0;
-            seg_d = 0.0;
-            seg_v.clear();
-        }
-    }
-
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
-    // 点位吸附：自动路由模式 <40m 吸附；自定义规划模式仅在 <=15m 时吸附，不把路线未经过的点强行拉过来。
-    // 同时跳过哨兵点（i<=1 或末点），并确保吸附后不与前后相邻点发生坐标重合，杜绝原地静止被误判为暂停。
+    // 点位吸附：自动路由模式 <40m 吸附；自定义规划模式仅在 <=15m 时吸附，不把路线未经过的点强行拉过来
     let snap_limit = snap_radius_m * snap_radius_m;
     for pl in snap_bd {
         let mut best_i = None;
         let mut best_d = 1e18f64;
         for (i, q) in locs.iter().enumerate() {
-            if i <= 1 || i >= locs.len() - 1 {
-                continue;
-            }
-            let dd = ((q.gLat - pl.0) * MET_PER_DEG_LAT).powi(2)
-                + ((q.gLng - pl.1) * MET_PER_DEG_LNG).powi(2);
+            let dd = ((q.gLat - pl.0) * meters_per_degree_lat(pl.0)).powi(2)
+                + ((q.gLng - pl.1) * meters_per_degree_lng(pl.0)).powi(2);
             if dd < best_d {
                 best_d = dd;
                 best_i = Some(i);
@@ -1256,20 +1188,14 @@ fn build_track_from_route(
         }
         if let Some(i) = best_i {
             if best_d < snap_limit {
-                let d_prev = ((pl.0 - locs[i - 1].gLat) * MET_PER_DEG_LAT)
-                    .hypot((pl.1 - locs[i - 1].gLng) * MET_PER_DEG_LNG);
-                let d_next = ((locs[i + 1].gLat - pl.0) * MET_PER_DEG_LAT)
-                    .hypot((locs[i + 1].gLng - pl.1) * MET_PER_DEG_LNG);
-                if d_prev >= 1.5 && d_next >= 1.5 {
-                    locs[i].gLat = round_to(pl.0, 7);
-                    locs[i].gLng = round_to(pl.1, 7);
-                }
+                locs[i].gLat = round_to(pl.0, 7);
+                locs[i].gLng = round_to(pl.1, 7);
             }
         }
     }
 
     let total_dis = round_to(dist, 3);
-    Ok(Track {
+    let mut track = Track {
         totalTime: round_to(t_acc, 0) as i64,
         totalDistance: total_dis,
         validDistance: total_dis,
@@ -1279,10 +1205,12 @@ fn build_track_from_route(
         startLongitude: locs[0].gLng,
         totalSteps: steps_acc as i64,
         locations: locs,
-        speedPerTenSec: ten_speed,
-        stepsPerTenSec: ten_steps,
-        segments,
-    })
+        speedPerTenSec: Vec::new(),
+        stepsPerTenSec: Vec::new(),
+        segments: Vec::new(),
+    };
+    track.rebuild_statistics();
+    Ok(track)
 }
 
 #[cfg(test)]
@@ -1386,8 +1314,8 @@ mod tests {
             &[start_pt, end_pt],
         );
         let last_loc = open_track.locations.last().unwrap();
-        let dist_to_end = (((last_loc.gLat - end_pt.0) * MET_PER_DEG_LAT).powi(2)
-            + ((last_loc.gLng - end_pt.1) * MET_PER_DEG_LNG).powi(2))
+        let dist_to_end = (((last_loc.gLat - end_pt.0) * meters_per_degree_lat(end_pt.0)).powi(2)
+            + ((last_loc.gLng - end_pt.1) * meters_per_degree_lng(end_pt.0)).powi(2))
         .sqrt();
         assert!(
             dist_to_end < 35.0,

@@ -7,8 +7,20 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 
+#[cfg(test)]
 pub const MET_PER_DEG_LAT: f64 = 111_132.0;
+#[cfg(test)]
 pub const MET_PER_DEG_LNG: f64 = 86_600.0;
+
+/// Local WGS84 metric scale. Longitude scale must follow the route latitude.
+pub fn meters_per_degree_lat(lat: f64) -> f64 {
+    let r = lat.to_radians();
+    111132.92 - 559.82 * (2.0*r).cos() + 1.175 * (4.0*r).cos() - 0.0023 * (6.0*r).cos()
+}
+pub fn meters_per_degree_lng(lat: f64) -> f64 {
+    let r = lat.to_radians();
+    (111412.84*r.cos() - 93.5*(3.0*r).cos() + 0.118*(5.0*r).cos()).max(0.001)
+}
 
 /// round(x, n)：按精确二进制值四舍五入。
 pub fn round_to(x: f64, n: usize) -> f64 {
@@ -45,7 +57,6 @@ impl Rng {
     {
         items[rand::Rng::gen_range(&mut self.inner, 0..items.len())]
     }
-    #[allow(dead_code)]
     pub fn weighted<T>(&mut self, items: &[(T, u32)]) -> T
     where
         T: Copy,
@@ -108,7 +119,7 @@ pub fn make_ordered_path(
         route_planner::CustomCloseMode::OutAndBack => {
             let plane: Vec<(f64, f64)> = bd_points
                 .iter()
-                .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+                .map(|q| ((q.1 - cy) * meters_per_degree_lng(cx), (q.0 - cx) * meters_per_degree_lat(cx)))
                 .collect();
             let samples = 18usize;
             let mut dense = Vec::new();
@@ -149,7 +160,7 @@ fn build_open_catmull(ordered: &[(f64, f64)], cx: f64, cy: f64) -> PointRing {
     let n = ordered.len();
     let plane: Vec<(f64, f64)> = ordered
         .iter()
-        .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+        .map(|q| ((q.1 - cy) * meters_per_degree_lng(cx), (q.0 - cx) * meters_per_degree_lat(cx)))
         .collect();
     let samples = 18usize;
     let mut dense = Vec::with_capacity((n - 1) * samples + 1);
@@ -193,7 +204,7 @@ fn build_catmull_ring(ordered: &[(f64, f64)], cx: f64, cy: f64) -> PointRing {
     let n = ordered.len();
     let plane: Vec<(f64, f64)> = ordered
         .iter()
-        .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+        .map(|q| ((q.1 - cy) * meters_per_degree_lng(cx), (q.0 - cx) * meters_per_degree_lat(cx)))
         .collect();
     let samples = 18usize;
     let mut dense = Vec::with_capacity(n * samples);
@@ -286,7 +297,7 @@ pub fn open_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
 }
 
 pub fn to_bd(x: f64, y: f64, c_lat: f64, c_lng: f64) -> (f64, f64) {
-    (c_lat + y / MET_PER_DEG_LAT, c_lng + x / MET_PER_DEG_LNG)
+    (c_lat + y / meters_per_degree_lat(c_lat), c_lng + x / meters_per_degree_lng(c_lat))
 }
 
 // ── 坐标基准转换：WGS84 ↔ GCJ-02 ↔ BD-09 ─────────────────────────
