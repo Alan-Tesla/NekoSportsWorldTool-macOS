@@ -497,8 +497,8 @@ impl App {
                     .iter()
                     .any(|&(mla, mlo)| (mla - cla).abs() < 1e-4 && (mlo - clo).abs() < 1e-4);
                 let hit = p.route.iter().any(|&(rla, rlo)| {
-                    let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
-                    let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
+                    let dy = (rla - cla) * crate::track::geom::meters_per_degree_lat(cla);
+                    let dx = (rlo - clo) * crate::track::geom::meters_per_degree_lng(cla);
                     dx.hypot(dy) <= 20.0
                 });
                 if is_must {

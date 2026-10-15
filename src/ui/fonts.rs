@@ -1,20 +1,20 @@
 //! 中文字体安装。
 //!
-//! 启动时从 Windows 字体目录加载微软雅黑（msyh.ttc）注入 egui；
+//! macOS / Android 使用内嵌 Noto Sans SC；Windows 从字体目录加载微软雅黑。
 //! 找不到则依次尝试 simhei.ttf / simsun.ttc；全部失败返回 false（不崩溃，
 //! 界面中文会显示为方块但不影响功能）。
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
 use std::path::PathBuf;
 
-#[cfg(target_os = "android")]
-const ANDROID_FONT: &[u8] = include_bytes!("../../assets/fonts/NotoSansSC-VF.ttf");
+#[cfg(any(target_os = "android", target_os = "macos"))]
+const BUNDLED_FONT: &[u8] = include_bytes!("../../assets/fonts/NotoSansSC-VF.ttf");
 
 /// 字体候选（按优先级）。
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
 const CANDIDATES: [&str; 4] = ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"];
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "macos")))]
 fn fonts_dir() -> PathBuf {
     std::env::var("WINDIR")
         .map(|w| PathBuf::from(w).join("Fonts"))
@@ -23,13 +23,13 @@ fn fonts_dir() -> PathBuf {
 
 /// 安装中文字体到 egui。返回实际加载的字体名（None = 全部失败）。
 pub fn install(ctx: &egui::Context) -> Option<String> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "macos"))]
     {
         let name = "Noto Sans SC".to_owned();
         let mut fonts = egui::FontDefinitions::default();
         fonts
             .font_data
-            .insert(name.clone(), egui::FontData::from_static(ANDROID_FONT));
+            .insert(name.clone(), egui::FontData::from_static(BUNDLED_FONT));
         if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             list.insert(0, name.clone());
         }
@@ -40,7 +40,7 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
         return Some(name);
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
     let dir = fonts_dir();
     for name in CANDIDATES {

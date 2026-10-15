@@ -14,7 +14,7 @@ use egui::{Align2, Color32, FontId, Mesh, Pos2, Rect, Stroke, TextureHandle, Vec
 
 use crate::track::generate_road::RoadPlan;
 use crate::track::geom::{
-    gcj02_to_bd09, wgs84_to_bd09, wgs84_to_gcj02, MET_PER_DEG_LAT, MET_PER_DEG_LNG,
+    gcj02_to_bd09, wgs84_to_bd09, wgs84_to_gcj02, meters_per_degree_lat, meters_per_degree_lng,
 };
 use crate::track::wire::bd09_to_gcj02;
 
@@ -310,8 +310,8 @@ impl MapState {
             f64::NEG_INFINITY,
         );
         for (la, lo) in pts {
-            let x = (lo - self.center.1) * MET_PER_DEG_LNG;
-            let y = (la - self.center.0) * MET_PER_DEG_LAT;
+            let x = (lo - self.center.1) * meters_per_degree_lng(self.center.0);
+            let y = (la - self.center.0) * meters_per_degree_lat(self.center.0);
             minx = minx.min(x);
             maxx = maxx.max(x);
             miny = miny.min(y);
@@ -327,8 +327,8 @@ impl MapState {
 
     /// 度坐标 → 屏幕坐标。
     pub fn to_screen(&self, rect: Rect, lat: f64, lon: f64) -> Pos2 {
-        let x = (lon - self.center.1) * MET_PER_DEG_LNG * self.scale as f64;
-        let y = -(lat - self.center.0) * MET_PER_DEG_LAT * self.scale as f64;
+        let x = (lon - self.center.1) * meters_per_degree_lng(self.center.0) * self.scale as f64;
+        let y = -(lat - self.center.0) * meters_per_degree_lat(self.center.0) * self.scale as f64;
         let c = rect.center();
         Pos2::new(
             (c.x as f64 + x + self.offset.x as f64) as f32,
@@ -342,8 +342,8 @@ impl MapState {
         let scale = (self.scale as f64).max(1e-6);
         let x = (pos.x as f64 - c.x as f64 - self.offset.x as f64) / scale;
         let y = (pos.y as f64 - c.y as f64 - self.offset.y as f64) / scale;
-        let lon = self.center.1 + x / MET_PER_DEG_LNG;
-        let lat = self.center.0 - y / MET_PER_DEG_LAT;
+        let lon = self.center.1 + x / meters_per_degree_lng(self.center.0);
+        let lat = self.center.0 - y / meters_per_degree_lat(self.center.0);
         (lat, lon)
     }
 
@@ -1101,8 +1101,8 @@ impl MapState {
             let min_d_m = route
                 .iter()
                 .map(|&(rla, rlo)| {
-                    let dy = (rla - cla) * MET_PER_DEG_LAT;
-                    let dx = (rlo - clo) * MET_PER_DEG_LNG;
+                    let dy = (rla - cla) * meters_per_degree_lat(cla);
+                    let dx = (rlo - clo) * meters_per_degree_lng(cla);
                     dx.hypot(dy)
                 })
                 .fold(f64::INFINITY, f64::min);

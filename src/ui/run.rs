@@ -199,11 +199,7 @@ impl RunPage {
         );
         let pace = plo + (phi - plo) * rand::random::<f32>();
         let dist = match self.effective_custom_km() {
-            Some(rkm) => {
-                // 自定义规划路径模式下，围绕所画路线的真实长度做 ±1.2% 的真人 GPS 级微幅波动
-                let jitter = 0.988 + 0.024 * rand::random::<f64>();
-                (rkm * jitter).max(0.05)
-            }
+            Some(rkm) => rkm.max(0.05),
             None => (lo + (hi - lo) * rand::random::<f32>()) as f64,
         };
         let dur = (dist * pace as f64).round() as i64;
@@ -336,7 +332,7 @@ impl App {
                     ui.colored_label(
                         theme::ok(),
                         format!(
-                            "跟随规划路径 {:.2} km（约 {:.0} m，「换一版」在此长度 ±1.2% 内微幅浮动）",
+                            "跟随规划路径 {:.2} km（约 {:.0} m，「换一版」保留路线长度，仅调整配速）",
                             rkm,
                             rkm * 1000.0
                         ),
@@ -976,8 +972,8 @@ impl App {
                     .iter()
                     .any(|&(mla, mlo)| (mla - cla).abs() < 1e-4 && (mlo - clo).abs() < 1e-4);
                 let hit = p.route.iter().any(|&(rla, rlo)| {
-                    let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
-                    let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
+                    let dy = (rla - cla) * crate::track::geom::meters_per_degree_lat(cla);
+                    let dx = (rlo - clo) * crate::track::geom::meters_per_degree_lng(cla);
                     dx.hypot(dy) <= 20.0
                 });
                 if is_must {
@@ -1373,8 +1369,8 @@ impl App {
                         .iter()
                         .any(|&(mla, mlo)| (mla - cla).abs() < 1e-4 && (mlo - clo).abs() < 1e-4);
                     let hit = route_pts.iter().any(|&(rla, rlo)| {
-                        let dy = (rla - cla) * crate::track::geom::MET_PER_DEG_LAT;
-                        let dx = (rlo - clo) * crate::track::geom::MET_PER_DEG_LNG;
+                        let dy = (rla - cla) * crate::track::geom::meters_per_degree_lat(cla);
+                        let dx = (rlo - clo) * crate::track::geom::meters_per_degree_lng(cla);
                         dx.hypot(dy) <= 20.0
                     });
                     if is_must {
@@ -1875,7 +1871,7 @@ mod tests {
         );
     }
 
-    /// 自定义规划路径模式下，方案距离与「换一版」应始终跟随规划路线长度（±1.5% 内微幅浮动），
+    /// 自定义规划路径模式下，方案距离与「换一版」应始终跟随规划路线长度（不随机改写里程），
     /// 而非被固定的 dist_min..dist_max 范围绑死。
     #[test]
     fn custom_route_len_syncs_plan_and_shuffle_stays_matched() {
@@ -1890,7 +1886,7 @@ mod tests {
         for _ in 0..20 {
             let plan = p.plan.as_ref().unwrap();
             assert!(
-                (plan.dist - 2.65).abs() < 0.05,
+                (plan.dist - 2.65).abs() < 1e-9,
                 "自定义规划路线 2.65km 时方案距离 {} 未对齐",
                 plan.dist
             );
@@ -1903,7 +1899,7 @@ mod tests {
         p.sync_planned_route_len(3400.0);
         let plan = p.plan.as_ref().unwrap();
         assert!(
-            (plan.dist - 3.40).abs() < 0.06,
+            (plan.dist - 3.40).abs() < 1e-9,
             "修改路线长度后方案距离 {} 未同步到 3.40km",
             plan.dist
         );
