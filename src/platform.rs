@@ -17,6 +17,19 @@ pub fn data_dir() -> std::path::PathBuf {
     {
         crate::android::data_dir()
     }
+    #[cfg(target_os = "macos")]
+    {
+        // Keep user data beside the app instead of changing its signed contents.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(bundle) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                if bundle.extension().is_some_and(|e| e == "app") {
+                    if let Some(parent) = bundle.parent() {
+                        return parent.join("NekoSportsWorldTool-data");
+                    }
+                }
+            }
+        }
+    }
     #[cfg(not(target_os = "android"))]
     {
         std::env::current_exe()

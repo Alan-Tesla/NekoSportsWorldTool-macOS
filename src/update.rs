@@ -62,6 +62,9 @@ pub struct ReleaseInfo {
 /// 检查最新 Release；比当前新返回 Some，已是最新返回 None。
 /// 多仓库（Android）时取带资产且版本最新的候选。
 pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, String> {
+    if cfg!(target_os = "macos") {
+        return Err("此 macOS 二开定制版请从源码重新构建更新，避免原版更新覆盖二开功能".into());
+    }
     let want = asset_name().ok_or_else(|| "当前平台没有对应的发布产物，无法自动更新".to_string())?;
     let current = current_version();
     let mut best: Option<ReleaseInfo> = None;
