@@ -2,6 +2,14 @@
 
 基于 [YanamiNeko/NekoSportsWorldTool](https://github.com/YanamiNeko/NekoSportsWorldTool) 与 [zxxhz 二开版本](https://github.com/zxxhz/NekoSportsWorldTool) 整理的 macOS 改进版。保留原项目历史与 CC BY-NC 4.0 许可证。原项目说明见 [README.upstream.md](README.upstream.md)。
 
+## 2026-10-17 更新
+
+- 合并路线方案，保留基于主干道的随机路线生成、覆盖和里程校验；配置保存在本机。
+- 随机结果保留选中状态，生成失败显示具体原因；修正转弯几何与新增立即折返。
+- 配速叠加缓慢随机变化，在总用时60%后逐渐减速；“换一版”刷新随机种子。
+- 修复图表配速单位（分钟/公里）和起点时间标记；历史记录不会自动修改。
+- 本机release构建与125项测试通过；第三方详情图显示仍待新记录验证。
+
 ## 本版改进
 
 - macOS 应用目录与可写数据目录适配，内置中文字体。
