@@ -87,6 +87,9 @@ impl Track {
         for point in &mut self.locations {
             let dt = point.totalTime - previous.0;
             point.avgSpeed = if dt > 0 { (point.totalDis - previous.1) / dt as f64 } else { 0.0 };
+            // Detail-chart contract: speed is decimal min/km; GPS avgSpeed/bdS remain m/s.
+            point.bdS = point.avgSpeed;
+            point.speed = if point.avgSpeed > 0.0 { 1000.0 / (60.0 * point.avgSpeed) } else { 0.0 };
             previous = (point.totalTime, point.totalDis);
         }
         self.speedPerTenSec.clear();

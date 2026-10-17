@@ -143,15 +143,14 @@ fn build_from_ring(
 
     // Stable cruising after a short warmup; use the same profile as road routing.
     let mut w = Vec::with_capacity(n);
-    let mut v = base*route_planner::kinematics::steady_pacing_factor(0.0,dur_f,30.0);
+    let kin = route_planner::kinematics::KinParams::default();
+    let mut latent = 0.0;
+    let mut smoothed = 0.0;
     for i in 0..n {
-        let dt = dts[i];
-        let factor = route_planner::kinematics::steady_pacing_factor(times[i],dur_f,30.0);
-        let target_v = (base*factor).clamp(local_floor,local_ceil);
-        let decay = (-0.04*dt).exp();
-        let noise_sd = 0.008*((1.0-decay*decay)/0.08).sqrt();
-        v = (target_v+(v-target_v)*decay+rng.gauss(0.0,noise_sd)).clamp(local_floor,local_ceil);
-        w.push(v);
+        let factor = route_planner::kinematics::steady_pacing_factor(times[i],dur_f,kin.warmup_s);
+        let variation = route_planner::kinematics::slow_pace_noise(
+            &mut latent, &mut smoothed, dts[i], rng.gauss(0.0,1.0), kin.theta, kin.sigma);
+        w.push((base*factor + variation).clamp(local_floor,local_ceil));
     }
 
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
@@ -242,16 +241,8 @@ fn build_from_ring(
         let brg =
             ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
         let avg_sp = round_to(d_step / dt.max(0.1), 4);
-        let kmh = avg_sp * 3.6;
-        let sigma = (kmh * 0.015).max(0.02);
-        let gps_speed = if i <= 1 {
-            0.0
-        } else {
-            round_to(
-                (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
-                4,
-            )
-        };
+        // Detail-chart pace in decimal min/km; GPS fields below retain m/s.
+        let gps_speed = if i <= 1 || avg_sp <= 0.0 { 0.0 } else { 1000.0 / (60.0 * avg_sp) };
 
         locs.push(GenPoint {
             id: i as i64 + 1,
@@ -279,7 +270,7 @@ fn build_from_ring(
             coorType: "gcj02".into(),
             bdA: round_to(alt, 2),
             bdD: round_to(brg, 2),
-            bdS: round_to((avg_sp * rng.uniform(0.6, 0.95)).max(0.0), 3),
+            bdS: avg_sp,
             bdG: rng.choice(&[1, 1, 1, -1]),
             count: rng.randint(20, 88),
             dtr: 0.0,

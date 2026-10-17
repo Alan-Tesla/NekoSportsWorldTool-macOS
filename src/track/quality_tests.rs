@@ -15,6 +15,9 @@ fn assert_conservation(t: &Track) {
         if dt>0 {
             let measured=(p[1].totalDis-p[0].totalDis)/dt as f64;
             assert!((measured-p[1].avgSpeed).abs()<1e-6);
+            assert!((measured-p[1].bdS).abs()<1e-6);
+            let pace=if measured>0.0 {1000.0/(60.0*measured)} else {0.0};
+            assert!((pace-p[1].speed).abs()<1e-6);
         }
     }
 }
@@ -113,11 +116,100 @@ fn pace_smoothness_and_late_fatigue_for_synthetic_route() {
     let p95=deltas[(deltas.len() as f64*0.95) as usize];
     let max=deltas.last().unwrap();
     println!("PACE_METRICS={}",serde_json::json!({"route_m":distance,"simulations":96,"adjacent_10s_pace_delta_p95":p95,"adjacent_10s_pace_delta_max":max,"runs":comparisons}));
-    assert!(p95 < 6.0, "10-second pace variation is too large: {p95}");
-    assert!(*max < 15.0, "abrupt pace change: {max}");
+    assert!(p95 < 2.5, "10-second pace variation is too large: {p95}");
+    assert!(*max < 5.0, "abrupt pace change: {max}");
     for run in &comparisons {
         let early=run["early_sec_per_km"].as_f64().unwrap();
         let late=run["late_sec_per_km"].as_f64().unwrap();
         assert!(late > early*1.025 && late < early*1.10,"fatigue should be gradual: {run}");
+    }
+}
+
+#[test]
+fn low_pass_reduces_short_interval_direction_reversals() {
+    let mut latent=0.0;
+    let mut smoothed=0.0;
+    let mut raw=Vec::new();
+    let mut filtered=Vec::new();
+    for i in 0..400 {
+        let z=if i%2==0 { 1.0 } else { -1.0 };
+        route_planner::kinematics::slow_pace_noise(&mut latent,&mut smoothed,5.0,z,1.0/75.0,0.0046);
+        raw.push(latent);filtered.push(smoothed);
+    }
+    let variation=|v:&[f64]|v.windows(2).map(|p|(p[1]-p[0]).abs()).sum::<f64>();
+    assert!(variation(&filtered)<variation(&raw)*0.20);
+}
+
+#[test]
+fn road_polyline_keeps_corners_without_extra_control_points() {
+    let points=vec![(0.0,0.0),(0.0,0.002),(0.002,0.002)];
+    let (dense,arcs,(lat,lon))=geom::make_ordered_path(&points,route_planner::CustomCloseMode::OpenPolyline);
+    let corner=(0.002*geom::meters_per_degree_lng(lat)-lon*geom::meters_per_degree_lng(lat),-lat*geom::meters_per_degree_lat(lat));
+    assert!(dense.iter().any(|p|(p.0-corner.0).abs()<1e-6 && (p.1-corner.1).abs()<1e-6));
+    assert!(dense.windows(2).all(|p|(p[1].0-p[0].0).hypot(p[1].1-p[0].1)<=4.001));
+    assert!(arcs.windows(2).all(|p|p[1]>=p[0]));
+    for (x,y) in dense { assert!((y-corner.1).abs()<1e-6 || (x-corner.0).abs()<1e-6); }
+    assert_eq!(route_planner::CustomCloseMode::from_str("polyline").as_str(),"polyline");
+    assert!(!route_planner::CustomCloseMode::OpenPolyline.is_closed());
+}
+
+#[test]
+fn rounded_road_has_curved_corners_without_wide_cutting() {
+    let points=vec![(0.0,0.0),(0.0,0.002),(0.002,0.002)];
+    let (path,arcs,(lat,lon))=geom::make_ordered_path(&points,route_planner::CustomCloseMode::OpenRounded);
+    let corner=((0.002-lon)*geom::meters_per_degree_lng(lat),-lat*geom::meters_per_degree_lat(lat));
+    assert!(path.iter().any(|p|p.0<corner.0-0.1 && p.1>corner.1+0.1));
+    assert!(path.iter().all(|p|(p.0-corner.0).abs().min((p.1-corner.1).abs())<=1.501));
+    assert!(arcs.windows(2).all(|p|p[1]>=p[0]));
+    assert!(path.windows(2).all(|p|(p[1].0-p[0].0).hypot(p[1].1-p[0].1)<=4.001));
+    for p in path.windows(3) {
+        let a=(p[1].0-p[0].0,p[1].1-p[0].1);let b=(p[2].0-p[1].0,p[2].1-p[1].1);
+        let n=a.0.hypot(a.1)*b.0.hypot(b.1);
+        if n>1e-9 { assert!((a.0*b.0+a.1*b.1)/n>0.97); }
+    }
+    assert_eq!(route_planner::CustomCloseMode::from_str("rounded").as_str(),"rounded");
+}
+
+#[test]
+fn rounded_road_handles_duplicate_points_and_retains_endpoints() {
+    let points=vec![(0.0,0.0),(0.0,0.0),(0.0,0.001),(0.0,0.001),(0.0,0.0)];
+    let (path,arcs,_)=geom::make_ordered_path(&points,route_planner::CustomCloseMode::OpenRounded);
+    assert_eq!(path.first(),path.last());
+    assert!(path.iter().all(|p|p.0.is_finite() && p.1.is_finite()));
+    assert!(arcs.iter().all(|x|x.is_finite()));
+    assert!(path.iter().all(|p|p.1.abs()<1e-8));
+}
+
+/// Optional local geometry diagnostic. Exports only route coordinates, not config or credentials.
+#[test]
+#[ignore]
+fn export_local_rounded_previews() {
+    let input=std::env::var("NEKO_ROUTE_CHECK_CONFIG").expect("set config path");
+    let output=std::env::var("NEKO_ROUTE_CHECK_OUTPUT").expect("set geometry output path");
+    let value:serde_json::Value=serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
+    let mut routes=Vec::new();
+    for preset in value["custom_route_presets"].as_array().unwrap() {
+        let points:Vec<(f64,f64)>=serde_json::from_value(preset["waypoints"].clone()).unwrap();
+        let (path,arcs,(lat,lon))=geom::make_ordered_path(&points,route_planner::CustomCloseMode::OpenRounded);
+        let geometry:Vec<_>=path.iter().map(|&(x,y)|geom::to_bd(x,y,lat,lon)).collect();
+        routes.push(serde_json::json!({"id":preset["id"],"length_m":arcs.last(),"route_bd09":geometry}));
+    }
+    std::fs::write(output,serde_json::to_vec_pretty(&routes).unwrap()).unwrap();
+}
+
+#[test]
+fn startup_marker_preserves_time_and_chart_uses_pace() {
+    let pts=vec![(0.0,0.0),(0.002,0.0),(0.002,0.003),(0.0,0.003)];
+    for seed in 0..32 {
+        let track=generator::build(1000.0,390,seed,(0.0,0.0),1_800_000_000_000,&pts);
+        let marker=&track.locations[1];
+        assert!(marker.totalTime>0);
+        assert_eq!(marker.totalDis,0.0);
+        let first=&track.locations[2];
+        let dt=(first.totalTime-marker.totalTime) as f64;
+        let expected_pace=dt*1000.0/(60.0*first.totalDis);
+        assert!((first.speed-expected_pace).abs()<1e-6);
+        assert!(first.speed>4.0 && first.speed<10.0,"startup pace {}",first.speed);
+        assert_conservation(&track);
     }
 }

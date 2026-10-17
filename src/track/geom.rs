@@ -115,6 +115,25 @@ pub fn make_ordered_path(
         return (vec![(0.0, 0.0)], vec![0.0, 1.0], (cx, cy));
     }
     match mode {
+        route_planner::CustomCloseMode::OpenRounded => build_rounded_road(bd_points, cx, cy),
+        route_planner::CustomCloseMode::OpenPolyline => {
+            let plane: Vec<_> = bd_points.iter().map(|q|
+                ((q.1-cy)*meters_per_degree_lng(cx), (q.0-cx)*meters_per_degree_lat(cx))).collect();
+            let mut dense = vec![plane[0]];
+            let mut arcs = vec![0.0];
+            for pair in plane.windows(2) {
+                let length = (pair[1].0-pair[0].0).hypot(pair[1].1-pair[0].1);
+                let steps = (length/4.0).ceil().max(1.0) as usize;
+                let begin = *arcs.last().unwrap();
+                for i in 1..=steps {
+                    let t = i as f64/steps as f64;
+                    dense.push((pair[0].0+(pair[1].0-pair[0].0)*t,
+                                pair[0].1+(pair[1].1-pair[0].1)*t));
+                    arcs.push(begin+length*t);
+                }
+            }
+            (dense, arcs, (cx, cy))
+        }
         route_planner::CustomCloseMode::Open => build_open_catmull(bd_points, cx, cy),
         route_planner::CustomCloseMode::OutAndBack => {
             let plane: Vec<(f64, f64)> = bd_points
@@ -153,6 +172,54 @@ pub fn make_ordered_path(
             build_catmull_ring(bd_points, cx, cy)
         }
     }
+}
+
+/// Local tangent-continuous quadratic fillets, not a global interpolating spline.
+/// The corner moves by at most 1.5m; straight road sections remain straight.
+/// Preserve near-180-degree turnarounds instead of inventing a turning loop.
+fn build_rounded_road(ordered: &[(f64, f64)], cx: f64, cy: f64) -> PointRing {
+    let mut plane: Vec<(f64,f64)> = Vec::new();
+    for &(lat,lon) in ordered {
+        let p=((lon-cy)*meters_per_degree_lng(cx),(lat-cx)*meters_per_degree_lat(cx));
+        if plane.last().is_none_or(|q| (p.0-q.0).hypot(p.1-q.1)>1e-6) { plane.push(p); }
+    }
+    let mut dense=vec![plane[0]];
+    let line_to=|dense:&mut Vec<(f64,f64)>,end:(f64,f64)| {
+        let start=*dense.last().unwrap();
+        let steps=((end.0-start.0).hypot(end.1-start.1)/4.0).ceil().max(1.0) as usize;
+        for j in 1..=steps {
+            let t=j as f64/steps as f64;
+            dense.push((start.0+(end.0-start.0)*t,start.1+(end.1-start.1)*t));
+        }
+    };
+    for i in 1..plane.len().saturating_sub(1) {
+        let (a,b,c)=(plane[i-1],plane[i],plane[i+1]);
+        let la=(b.0-a.0).hypot(b.1-a.1);
+        let lb=(c.0-b.0).hypot(c.1-b.1);
+        let u=((b.0-a.0)/la,(b.1-a.1)/la);
+        let v=((c.0-b.0)/lb,(c.1-b.1)/lb);
+        let angle=(u.0*v.0+u.1*v.1).clamp(-1.0,1.0).acos();
+        if !(3.0f64.to_radians()..170.0f64.to_radians()).contains(&angle) {
+            line_to(&mut dense,b);
+            continue;
+        }
+        let trim=8.0f64.min(la*0.25).min(lb*0.25).min(3.0/(angle*0.5).sin());
+        let entry=(b.0-u.0*trim,b.1-u.1*trim);
+        let exit=(b.0+v.0*trim,b.1+v.1*trim);
+        line_to(&mut dense,entry);
+        let steps=(2.0*trim).ceil().max(6.0) as usize;
+        for j in 1..=steps {
+            let t=j as f64/steps as f64;let k=1.0-t;
+            dense.push((k*k*entry.0+2.0*k*t*b.0+t*t*exit.0,
+                        k*k*entry.1+2.0*k*t*b.1+t*t*exit.1));
+        }
+    }
+    line_to(&mut dense,*plane.last().unwrap());
+    let mut arcs=vec![0.0];
+    for p in dense.windows(2) {
+        arcs.push(arcs.last().unwrap()+(p[1].0-p[0].0).hypot(p[1].1-p[0].1));
+    }
+    (dense,arcs,(cx,cy))
 }
 
 /// 开环 Catmull-Rom 样条：从 `ordered[0]` 依次平滑穿过各点到达 `ordered[n-1]`，首尾不闭合。

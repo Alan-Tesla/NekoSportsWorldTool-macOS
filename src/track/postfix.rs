@@ -16,8 +16,8 @@ pub fn apply_post_fixes(locs: &mut [GenPoint], rng: &mut Rng, start_ms: i64) {
         sp.bdS = 0.0;
         sp.totalDis = 0.0;
         sp.validDis = 0.0;
-        sp.totalTime = 0;
-        sp.validTime = 0;
+        // Preserve the actual stationary interval. Resetting this timestamp to zero
+        // incorrectly folds startup waiting time into the first moving sample.
         sp.steps = 0;
         // 终点哨兵
         let last = locs.len() - 1;

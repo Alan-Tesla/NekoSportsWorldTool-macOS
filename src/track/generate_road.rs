@@ -1126,16 +1126,8 @@ fn build_track_from_route(
         let brg =
             ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
         let avg_sp = round_to(d_step / dt.max(0.1), 4);
-        let kmh = avg_sp * 3.6;
-        let sigma = (kmh * 0.015).max(0.02);
-        let gps_speed = if i <= 1 {
-            0.0
-        } else {
-            round_to(
-                (kmh + rng.gauss(0.0, sigma)).clamp(SPEED_FLOOR * 3.6, SPEED_CEIL * 3.6),
-                4,
-            )
-        };
+        // Detail-chart pace in decimal min/km; GPS fields below retain m/s.
+        let gps_speed = if i <= 1 || avg_sp <= 0.0 { 0.0 } else { 1000.0 / (60.0 * avg_sp) };
 
         locs.push(GenPoint {
             id: i as i64 + 1,
@@ -1163,7 +1155,7 @@ fn build_track_from_route(
             coorType: "gcj02".into(),
             bdA: round_to(alt, 2),
             bdD: round_to(brg, 2),
-            bdS: round_to((avg_sp * rng.uniform(0.6, 0.95)).max(0.0), 3),
+            bdS: avg_sp,
             bdG: rng.choice(&[1, 1, 1, -1]),
             count: rng.randint(20, 88),
             dtr: 0.0,
