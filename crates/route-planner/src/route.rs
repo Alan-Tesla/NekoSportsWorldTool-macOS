@@ -313,6 +313,10 @@ pub enum CustomCloseMode {
     /// 开环单程：从起点按序经过全部途经点（可含中间跑圈段）直接到终点结束，首尾不闭合。
     #[default]
     Open,
+    /// 按道路折线连接；保留拐点，内部采样不增加用户途经点。
+    OpenPolyline,
+    /// 保留道路直线，仅在转角附近进行有界圆滑过渡。
+    OpenRounded,
     /// 闭合环线：按序连接全部途经点后，沿最短道路回到起点形成闭环。
     Loop,
     /// 原路折返：按序从起点到终点，再沿原路返回起点（往返闭合）。
@@ -324,6 +328,8 @@ pub enum CustomCloseMode {
 impl CustomCloseMode {
     pub fn from_str(s: &str) -> Self {
         match s {
+            "polyline" => CustomCloseMode::OpenPolyline,
+            "rounded" => CustomCloseMode::OpenRounded,
             "loop" => CustomCloseMode::Loop,
             "out_and_back" => CustomCloseMode::OutAndBack,
             "auto_pad" => CustomCloseMode::AutoPadLoop,
@@ -334,6 +340,8 @@ impl CustomCloseMode {
     pub fn as_str(self) -> &'static str {
         match self {
             CustomCloseMode::Open => "open",
+            CustomCloseMode::OpenPolyline => "polyline",
+            CustomCloseMode::OpenRounded => "rounded",
             CustomCloseMode::Loop => "loop",
             CustomCloseMode::OutAndBack => "out_and_back",
             CustomCloseMode::AutoPadLoop => "auto_pad",
@@ -343,6 +351,8 @@ impl CustomCloseMode {
     pub fn label(self) -> &'static str {
         match self {
             CustomCloseMode::Open => "开环单程（起点→终点，不闭合）",
+            CustomCloseMode::OpenPolyline => "沿道路折线（保留拐点）",
+            CustomCloseMode::OpenRounded => "沿道路圆角（自然转弯）",
             CustomCloseMode::Loop => "闭合环线（自动回起点）",
             CustomCloseMode::OutAndBack => "原路折返（往返路线）",
             CustomCloseMode::AutoPadLoop => "自动凑距闭环（必经+游走）",
@@ -350,7 +360,7 @@ impl CustomCloseMode {
     }
 
     pub fn is_closed(self) -> bool {
-        !matches!(self, CustomCloseMode::Open)
+        !matches!(self, CustomCloseMode::Open | CustomCloseMode::OpenPolyline | CustomCloseMode::OpenRounded)
     }
 }
 
@@ -401,7 +411,7 @@ pub fn plan_custom_nodes(
     }
 
     match mode {
-        CustomCloseMode::Open => Ok(forward),
+        CustomCloseMode::Open | CustomCloseMode::OpenPolyline | CustomCloseMode::OpenRounded => Ok(forward),
         CustomCloseMode::Loop => {
             if cur != start {
                 let back = shortest_path(g, cur, start)

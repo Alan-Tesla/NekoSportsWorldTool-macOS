@@ -34,14 +34,14 @@ impl Default for KinParams {
             brake_max: 1.5,
             lookahead_m: 40.0,
             warmup_s: 30.0,
-            theta: 0.04,
-            sigma: 0.008,
+            theta: 1.0 / 75.0,
+            sigma: 0.0046,
         }
     }
 }
 
 /// Illustrative pacing profile, not an observation of any particular runner.
-/// Cruise steadily after warmup; introduce gradual fatigue only after 40% elapsed.
+/// Cruise steadily after warmup; introduce gradual fatigue only after 60% elapsed.
 /// The final target speed is 7% below cruising speed, without abrupt phase changes.
 pub fn steady_pacing_factor(elapsed: f64, duration: f64, warmup: f64) -> f64 {
     let u = (elapsed / duration.max(1.0)).clamp(0.0, 1.0);
@@ -49,9 +49,23 @@ pub fn steady_pacing_factor(elapsed: f64, duration: f64, warmup: f64) -> f64 {
         let t = (elapsed / warmup).clamp(0.0, 1.0);
         0.90 + 0.10 * t * t * (3.0 - 2.0 * t)
     } else { 1.0 };
-    let t = ((u - 0.40) / 0.60).clamp(0.0, 1.0);
+    let t = ((u - 0.60) / 0.40).clamp(0.0, 1.0);
     let fatigue = t * t * (3.0 - 2.0 * t);
     warm * (1.0 - 0.07 * fatigue)
+}
+
+/// Correlated variation with a 75s OU timescale and a 25s low-pass response.
+/// Filtering the variation (not the fatigue trend) removes per-sample jitter.
+/// The timescales describe a stochastic process, not fixed oscillation periods.
+pub fn slow_pace_noise(latent: &mut f64, smoothed: &mut f64, dt: f64,
+    standard_normal: f64, theta: f64, sigma: f64) -> f64 {
+    let theta = theta.max(1e-6);
+    let decay = (-theta * dt).exp();
+    let sd = sigma * ((1.0 - decay * decay) / (2.0 * theta)).sqrt();
+    *latent = *latent * decay + sd * standard_normal;
+    let response = 1.0 - (-dt / 25.0).exp();
+    *smoothed += response * (*latent - *smoothed);
+    *smoothed
 }
 
 /// 从弧长 s 出发，在 lookahead 范围内取最小的「可刹停速度」。
@@ -107,15 +121,14 @@ pub fn pace_profile(
     let total_time_est: f64 = dts.iter().sum::<f64>().max(1.0);
 
     let mut w = Vec::with_capacity(n);
-    let mut v = v0*steady_pacing_factor(0.0,total_time_est,p.warmup_s);
+    let mut latent = 0.0;
+    let mut smoothed = 0.0;
     let mut t = 0.0;
     for &dt in dts {
-        let target_v = (v0*steady_pacing_factor(t,total_time_est,p.warmup_s)).clamp(floor,ceil);
-        let theta = p.theta.max(1e-6);
-        let decay = (-theta*dt).exp();
-        let noise_sd = p.sigma*((1.0-decay*decay)/(2.0*theta)).sqrt();
-        v = (target_v+(v-target_v)*decay+noise_sd*normal.sample(&mut rng)).clamp(floor,ceil);
-        w.push(v);
+        let variation = slow_pace_noise(&mut latent, &mut smoothed, dt,
+            normal.sample(&mut rng), p.theta, p.sigma);
+        let target_v = v0 * steady_pacing_factor(t, total_time_est, p.warmup_s);
+        w.push((target_v + variation).clamp(floor, ceil));
         t += dt;
     }
 
