@@ -87,6 +87,10 @@ pub struct RunPage {
     pub planned_route_km: Option<f64>,
     /// 是否展开跑圈设计器面板
     pub show_loop_designer: bool,
+    /// Numbered route handles are shown only while explicitly editing.
+    pub edit_route: bool,
+    pub save_preset_id: String,
+    pub route_generation_error: Option<String>,
     /// 特殊途经点徽章（如跑圈的「入」「出」标记）
     pub special_badges: Vec<(usize, String, egui::Color32)>,
     /// 地图视图状态
@@ -604,10 +608,100 @@ impl App {
         };
 
         let is_custom = mode == RouteMode::Custom;
-        let (pts_bd, fences, _must) = self.cached_points_and_fences();
+        let (pts_bd, fences, must) = self.cached_points_and_fences();
+        let all_checkpoints: Vec<_> = pts_bd.iter().chain(must.iter()).copied().collect();
 
         // 自定义规划路径的内联控制栏
         if is_custom {
+            let mut switched_preset = None;
+            let mut save_preset = false;
+            let mut randomized_preset = None;
+            ui.add_space(4.0);
+            mobile::row(ui, |ui| {
+                ui.label("路线方案：");
+                ui.toggle_value(&mut self.run_page.edit_route, "手绘编辑")
+                    .on_hover_text("点击地图加点，拖动控制点改线，右键删点；关闭后仅预览完整路线");
+                let unified = self.config.custom_route_presets.iter().any(|p|p.id=="unified");
+                let choices = if unified {
+                    vec![("unified", "校园跑", "合并已确认的操场与环校路线；随机生成会选择基础路线并更换部分主干道路段")]
+                } else {
+                    vec![("stadium", "绕操场", "保留操场跑道与校园道路路线"),
+                         ("campus", "环校跑", "东侧进入跑道经过西侧点位，再由南门回主干道")]
+                };
+                for (id, label, hint) in choices {
+                    let available = self.config.custom_route_presets.iter()
+                        .any(|p| p.id == id && p.waypoints.len() >= 2);
+                    let selected = self.config.custom_preset_selected(id);
+                    let random_selected = self.config.custom_preset_random_selected(id);
+                    let display_label = if random_selected {format!("{label}（随机）")} else {label.to_string()};
+                    ui.push_id(id, |ui| {
+                        ui.vertical(|ui| {
+                            if ui.add_enabled(available, egui::SelectableLabel::new(selected, display_label))
+                                .on_hover_text(if available { hint } else { "尚未配置此路线方案" })
+                                .clicked() && self.config.apply_custom_preset(id) {
+                                self.run_page.route_generation_error = None;
+                                switched_preset = Some(label);
+                                self.run_page.save_preset_id = id.into();
+                            }
+                            if ui.add_enabled(available, egui::Button::new("生成随机路线"))
+                                .on_hover_text("基于原方案在已确认的主干道上更换部分路径；保留操场与进出通道，检查4公里以上及全部点位后更新")
+                                .clicked() {
+                                match self.config.randomize_main_road_preset(id, &all_checkpoints) {
+                                    Ok(()) => {
+                                    self.run_page.route_generation_error = None;
+                                    randomized_preset = Some(label);
+                                    self.run_page.save_preset_id = id.into();
+                                    }
+                                    Err(reason) => { self.run_page.route_generation_error = Some(reason.clone()); self.status = reason; }
+                                }
+                            }
+                        });
+                    });
+                }
+                if self.run_page.edit_route {
+                    if unified {
+                        self.run_page.save_preset_id = "unified".into();
+                    }
+                    if self.run_page.save_preset_id.is_empty() {
+                        self.run_page.save_preset_id = if self.config.custom_preset_selected("stadium") {
+                            "stadium".into()
+                        } else { "campus".into() };
+                    }
+                    if unified {
+                        ui.label("保存为校园跑");
+                    } else {
+                    egui::ComboBox::from_id_salt("save_handdrawn_route")
+                        .selected_text(if self.run_page.save_preset_id == "stadium" { "保存为绕操场" } else { "保存为环校跑" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.run_page.save_preset_id, "stadium".into(), "保存为绕操场");
+                            ui.selectable_value(&mut self.run_page.save_preset_id, "campus".into(), "保存为环校跑");
+                        });
+                    }
+                    save_preset = ui.add_enabled(self.config.custom_waypoints.len() >= 2,
+                        egui::Button::new("保存方案")).clicked();
+                }
+            });
+            if let Some(reason) = &self.run_page.route_generation_error {
+                ui.add(egui::Label::new(egui::RichText::new(reason).color(theme::warn())).wrap());
+            }
+            if save_preset && self.config.save_custom_preset(&self.run_page.save_preset_id) {
+                self.sync_custom_route_config();
+                self.status = "手绘路线已保存到所选方案".into();
+            }
+            if let Some(label) = switched_preset {
+                self.osm_page.snap_road = self.config.custom_snap_road;
+                self.run_page.map_fitted = false;
+                self.osm_page.fitted = false;
+                self.sync_custom_route_config();
+                self.status = format!("已切换为{label}，路线与里程已更新，要求经过全部点位");
+            }
+            if let Some(label) = randomized_preset {
+                self.osm_page.snap_road = self.config.custom_snap_road;
+                self.run_page.map_fitted = false;
+                self.osm_page.fitted = false;
+                self.sync_custom_route_config();
+                self.status = format!("已生成{label}随机路线：已更换部分主干道路段，距离与全部点位检查通过");
+            }
             let mut close_mode = CustomCloseMode::from_str(&self.config.custom_close_mode);
             let prev_close = close_mode;
             let prev_clip = self.config.custom_clip_fence;
@@ -647,6 +741,8 @@ impl App {
                     .show_ui(ui, |ui| {
                         for m in [
                             CustomCloseMode::Open,
+                            CustomCloseMode::OpenPolyline,
+                            CustomCloseMode::OpenRounded,
                             CustomCloseMode::Loop,
                             CustomCloseMode::OutAndBack,
                             CustomCloseMode::AutoPadLoop,
@@ -1183,7 +1279,7 @@ impl App {
                     .map
                     .draw_route_with_arrows(&painter, canvas, &p.route, route_c, 2.8);
             }
-            if is_custom {
+            if is_custom && self.run_page.edit_route {
                 let badges: Vec<(usize, &str, egui::Color32)> = self
                     .run_page
                     .special_badges
@@ -1221,14 +1317,14 @@ impl App {
             let label = if let Some(err) = &p.route_error {
                 err.clone()
             } else if p.length_m > 0.0 {
-                if is_custom && close_mode_now == CustomCloseMode::Open {
+                if is_custom && !close_mode_now.is_closed() {
                     format!(
-                        "本次方案 {:.2} km · 开环总长 {:.0} m · 已途经打卡点 {}/{} · {} 途经点",
+                        "本次方案 {:.2} km · 路线总长 {:.0} m · 已途经打卡点 {}/{}{}",
                         plan.dist,
                         p.length_m,
                         total_passed,
                         p.checkpoints.len(),
-                        self.config.custom_waypoints.len(),
+                        if self.run_page.edit_route { format!(" · {} 控制点", self.config.custom_waypoints.len()) } else { String::new() },
                     )
                 } else {
                     let loops = plan.dist * 1000.0 / p.length_m;
@@ -1240,8 +1336,8 @@ impl App {
                             loops,
                             total_passed,
                             p.checkpoints.len(),
-                            if is_custom {
-                                format!(" · {} 途经点", self.config.custom_waypoints.len())
+                            if is_custom && self.run_page.edit_route {
+                                format!(" · {} 控制点", self.config.custom_waypoints.len())
                             } else {
                                 String::new()
                             }
@@ -1253,8 +1349,8 @@ impl App {
                             p.length_m,
                             total_passed,
                             p.checkpoints.len(),
-                            if is_custom {
-                                format!(" · {} 途经点", self.config.custom_waypoints.len())
+                            if is_custom && self.run_page.edit_route {
+                                format!(" · {} 控制点", self.config.custom_waypoints.len())
                             } else {
                                 String::new()
                             }
@@ -1286,9 +1382,9 @@ impl App {
         }
 
         self.run_page.map.draw_scale_bar(&painter, canvas);
-        self.run_page.map.draw_hud_footer(&painter, canvas, is_custom);
+        self.run_page.map.draw_hud_footer(&painter, canvas, is_custom && self.run_page.edit_route);
 
-        if is_custom {
+        if is_custom && self.run_page.edit_route {
             let net_ref = self.network.clone();
             let clip_fence = self.config.custom_clip_fence;
             let snap_road_enabled = self.config.custom_snap_road && net_ref.is_some();

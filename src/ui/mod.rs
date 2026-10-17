@@ -346,6 +346,9 @@ impl App {
             ai_confirm: None,
             tab: 0,
             run_page: run::RunPage {
+                edit_route: false,
+                save_preset_id: String::new(),
+                route_generation_error: None,
                 dist_min: config.dist_min,
                 dist_max: config.dist_max,
                 pace_min: config.pace_min,

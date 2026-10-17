@@ -27,6 +27,7 @@ pub struct OsmPage {
     pub show_labels: bool,
     pub playground_laps: i64,
     pub show_loop_designer: bool,
+    pub edit_route: bool,
     pub special_badges: Vec<(usize, String, egui::Color32)>,
     pub preview: Option<RoadPlan>,
     pub preview_stale: bool,
@@ -45,6 +46,7 @@ impl Default for OsmPage {
             show_labels: true,
             playground_laps: 2,
             show_loop_designer: false,
+            edit_route: false,
             special_badges: Vec::new(),
             preview: None,
             preview_stale: true,
@@ -112,6 +114,8 @@ impl App {
         // ── 第 2 栏：路径规划与底图工具栏 ───────────────────────────
         let mut close_mode = CustomCloseMode::from_str(&self.config.custom_close_mode);
         let prev_close = close_mode;
+        ui.toggle_value(&mut self.osm_page.edit_route, "手绘编辑")
+            .on_hover_text("点击加点、拖动改线、右键删除；关闭后拖动仅平移地图");
         let mut tile_source = TileSource::from_str(&self.config.tile_source);
         let prev_tile = tile_source;
         let prev_clip = self.config.custom_clip_fence;
@@ -175,6 +179,8 @@ impl App {
                 .show_ui(ui, |ui| {
                     for m in [
                         CustomCloseMode::Open,
+                            CustomCloseMode::OpenPolyline,
+                            CustomCloseMode::OpenRounded,
                         CustomCloseMode::Loop,
                         CustomCloseMode::OutAndBack,
                         CustomCloseMode::AutoPadLoop,
@@ -600,7 +606,7 @@ impl App {
             if let Some(p) = &self.osm_page.preview {
                 if p.length_m > 0.0 {
                     ui.separator();
-                    if close_mode == CustomCloseMode::Open {
+                    if !close_mode.is_closed() {
                         ui.colored_label(
                             theme::ok(),
                             format!(
@@ -770,15 +776,25 @@ impl App {
                 .iter()
                 .map(|(idx, s, c)| (*idx, s.as_str(), *c))
                 .collect();
-            self.osm_page
-                .map
-                .draw_waypoints_ext(&painter, canvas, &self.config.custom_waypoints, &badges);
+            if self.osm_page.edit_route {
+                self.osm_page.map.draw_waypoints_ext(&painter, canvas, &self.config.custom_waypoints, &badges);
+            } else {
+                for (point, color) in [
+                    (p.route.first(), egui::Color32::from_rgb(22,160,90)),
+                    (p.route.last(), egui::Color32::from_rgb(220,50,47)),
+                ] {
+                    if let Some(&(lat,lon)) = point {
+                        self.osm_page.map.draw_point(&painter, canvas, lat, lon, color, 4.5);
+                    }
+                }
+            }
         }
 
         self.osm_page.map.draw_scale_bar(&painter, canvas);
-        self.osm_page.map.draw_hud_footer(&painter, canvas, true);
+        self.osm_page.map.draw_hud_footer(&painter, canvas, self.osm_page.edit_route);
 
         // ── 处理交互点击/拖拽/删除途经点 ─────────────────────────────
+        if self.osm_page.edit_route {
         let net_ref = self.network.clone();
         let clip_fence = self.config.custom_clip_fence;
         let snap_road_enabled = self.config.custom_snap_road && net_ref.is_some();
@@ -809,6 +825,9 @@ impl App {
         );
         if edit.changed() {
             self.sync_custom_route_config();
+        }
+        } else {
+            self.osm_page.map.interact(ui, canvas);
         }
 
         if load_now {
