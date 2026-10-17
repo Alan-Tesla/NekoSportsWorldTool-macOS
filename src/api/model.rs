@@ -42,6 +42,22 @@ impl Session {
     }
 }
 
+/// A local named route; personal coordinates stay in config.json.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CustomRoutePreset {
+    pub id: String,
+    pub waypoints: Vec<(f64, f64)>,
+    pub close_mode: String,
+    pub clip_fence: bool,
+    pub snap_road: bool,
+    /// Approved edge indices in this saved base; empty after manual replacement.
+    #[serde(default)]
+    pub random_main_road_edges: Vec<usize>,
+    /// Optional internal base routes for a single combined UI preset.
+    #[serde(default)]
+    pub random_source_ids: Vec<String>,
+}
+
 /// UI 参数（config.json）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -83,6 +99,12 @@ pub struct Config {
     /// 用户在地图上自定义规划的途经点列表（BD-09，(lat, lon)）。
     #[serde(default)]
     pub custom_waypoints: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub custom_route_presets: Vec<CustomRoutePreset>,
+    #[serde(default)]
+    pub custom_generated_preset: String,
+    #[serde(default)]
+    pub custom_generated_route_hash: u64,
     /// 自定义路径闭合方式：loop | out_and_back | auto_pad。
     #[serde(default = "default_custom_close_mode")]
     pub custom_close_mode: String,
@@ -195,6 +217,9 @@ impl Default for Config {
             osm_path: String::new(),
             route_mode: default_route_mode(),
             custom_waypoints: Vec::new(),
+            custom_route_presets: Vec::new(),
+            custom_generated_preset: String::new(),
+            custom_generated_route_hash: 0,
             custom_close_mode: default_custom_close_mode(),
             custom_clip_fence: true,
             custom_snap_road: false,
@@ -215,6 +240,113 @@ impl Default for Config {
 
 fn exe_dir() -> std::path::PathBuf {
     crate::platform::data_dir()
+}
+
+impl Config {
+    // Stable non-security fingerprint; manual geometry/mode edits invalidate
+    // provenance without retaining an extra copy of location coordinates.
+    fn custom_route_hash(&self) -> u64 {
+        let mut hash=14695981039346656037u64;
+        let mut feed=|bytes: &[u8]| {for b in bytes {hash^=*b as u64;hash=hash.wrapping_mul(1099511628211);}};
+        for (lat,lon) in &self.custom_waypoints {feed(&lat.to_bits().to_le_bytes());feed(&lon.to_bits().to_le_bytes());}
+        feed(self.custom_close_mode.as_bytes());feed(&[self.custom_clip_fence as u8,self.custom_snap_road as u8]);hash
+    }
+    pub fn custom_preset_random_selected(&self, id: &str) -> bool {
+        self.route_mode=="custom" && self.custom_generated_preset==id
+            && self.custom_generated_route_hash==self.custom_route_hash()
+            && self.custom_route_presets.iter().any(|p|p.id==id)
+    }
+
+    pub fn save_custom_preset(&mut self, id: &str) -> bool {
+        if self.custom_waypoints.len() < 2 { return false; }
+        let Some(preset) = self.custom_route_presets.iter_mut().find(|p| p.id == id) else { return false; };
+        if preset.waypoints != self.custom_waypoints {
+            preset.random_main_road_edges.clear();
+            preset.random_source_ids.clear();
+        }
+        preset.waypoints = self.custom_waypoints.clone();
+        preset.close_mode = self.custom_close_mode.clone();
+        preset.clip_fence = self.custom_clip_fence;
+        preset.snap_road = self.custom_snap_road;
+        self.custom_generated_preset.clear();
+        true
+    }
+
+    pub fn custom_preset_selected(&self, id: &str) -> bool {
+        self.custom_preset_random_selected(id) || self.custom_route_presets.iter().any(|p| p.id == id
+            && p.waypoints == self.custom_waypoints
+            && p.close_mode == self.custom_close_mode
+            && p.clip_fence == self.custom_clip_fence
+            && p.snap_road == self.custom_snap_road)
+    }
+
+    fn random_route_sources(&self, id: &str) -> Result<Vec<CustomRoutePreset>,String> {
+        let preset=self.custom_route_presets.iter().find(|p|p.id==id)
+            .ok_or("未找到基础方案")?;
+        if preset.random_source_ids.is_empty() {return Ok(vec![preset.clone()]);}
+        let mut sources=Vec::new();
+        for source_id in &preset.random_source_ids {
+            let source=self.custom_route_presets.iter()
+                .find(|p|p.id==*source_id && p.id!=id && p.random_source_ids.is_empty())
+                .ok_or("合并方案的基础路线配置无效")?;
+            if !sources.iter().any(|p: &CustomRoutePreset|p.id==source.id) {sources.push(source.clone());}
+        }
+        Ok(sources)
+    }
+
+    pub fn randomize_main_road_preset(&mut self, id: &str, checkpoints: &[(f64,f64)]) -> Result<(),String> {
+        use rand::seq::SliceRandom;
+        let mut sources=self.random_route_sources(id)?;
+        let mut rng=rand::thread_rng();sources.shuffle(&mut rng);
+        let mut reason="没有可用的基础路线".to_string();
+        for preset in sources {
+            let route=match super::route_variants::vary_main_roads(&preset.waypoints,
+                &self.custom_waypoints,&preset.random_main_road_edges,&preset.close_mode,
+                checkpoints,&mut rng) {
+                Ok(route)=>route,Err(e)=>{reason=e;continue;}
+            };
+            self.custom_waypoints=route;
+            self.custom_close_mode=preset.close_mode;
+            self.custom_clip_fence=preset.clip_fence;
+            self.custom_snap_road=preset.snap_road;
+            self.route_mode="custom".into();self.allowed_skip_ordinary=0;
+            self.custom_generated_preset=id.into();
+            self.custom_generated_route_hash=self.custom_route_hash();
+            return Ok(());
+        }
+        Err(reason)
+    }
+
+    /// Generate from the saved base, never from the previous random result.
+    /// Preserves the base preset and its road segment inventory.
+    #[cfg(test)]
+    pub fn randomize_custom_preset(&mut self, id: &str) -> bool {
+        let Some(preset) = self.custom_route_presets.iter().find(|p| p.id == id).cloned()
+            else { return false; };
+        let Some(route) = super::route_variants::random_route(
+            &preset.waypoints, &self.custom_waypoints, &mut rand::thread_rng())
+            else { return false; };
+        self.custom_waypoints = route;
+        self.custom_close_mode = preset.close_mode;
+        self.custom_clip_fence = preset.clip_fence;
+        self.custom_snap_road = preset.snap_road;
+        self.route_mode = "custom".into();
+        self.allowed_skip_ordinary = 0;
+        true
+    }
+
+    pub fn apply_custom_preset(&mut self, id: &str) -> bool {
+        let Some(preset) = self.custom_route_presets.iter()
+            .find(|p| p.id == id && p.waypoints.len() >= 2).cloned() else { return false };
+        self.custom_generated_preset.clear();
+        self.custom_waypoints = preset.waypoints;
+        self.custom_close_mode = preset.close_mode;
+        self.custom_clip_fence = preset.clip_fence;
+        self.custom_snap_road = preset.snap_road;
+        self.route_mode = "custom".into();
+        self.allowed_skip_ordinary = 0;
+        true
+    }
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
@@ -551,4 +683,127 @@ pub fn load_must_points_cache() -> Vec<(f64, f64)> {
 
 pub fn save_must_points_cache(must_points: &[(f64, f64)]) -> Result<(), String> {
     write_json("must_points_cache.json", &must_points.to_vec())
+}
+
+#[cfg(test)]
+mod custom_preset_tests {
+    use super::*;
+    #[test]
+    fn switching_presets_roundtrips_routes_and_preserves_pace() {
+        let mut c=Config::default();
+        let pace=c.pace_min;
+        for (id,lat) in [("stadium",1.0),("campus",2.0)] {
+            c.custom_route_presets.push(CustomRoutePreset { id:id.into(),
+                waypoints:vec![(lat,0.0),(lat,0.001)], close_mode:"open".into(),
+                clip_fence:false,snap_road:false,random_main_road_edges:Vec::new(),random_source_ids:Vec::new() });
+        }
+        assert!(c.apply_custom_preset("stadium"));
+        let original=c.custom_waypoints.clone();
+        assert!(c.apply_custom_preset("campus"));
+        assert!(c.custom_preset_selected("campus"));
+        assert!(!c.custom_preset_selected("stadium"));
+        let mut c:Config=serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(c.apply_custom_preset("stadium"));
+        assert_eq!(c.custom_waypoints,original);
+        assert_eq!(c.pace_min,pace);
+        assert_eq!(c.allowed_skip_ordinary,0);
+        c.custom_waypoints.reverse();
+        assert!(!c.custom_preset_selected("stadium"));
+        assert!(c.save_custom_preset("stadium"));
+        assert!(c.custom_preset_selected("stadium"));
+        let edited=c.custom_waypoints.clone();
+        c.apply_custom_preset("campus");
+        c.apply_custom_preset("stadium");
+        assert_eq!(c.custom_waypoints,edited);
+    }
+    #[test]
+    fn random_generation_keeps_both_bases_and_pace_and_can_restore() {
+        let mut c=Config::default();
+        for (id,lat) in [("stadium",1.0),("campus",2.0)] {
+            c.custom_route_presets.push(CustomRoutePreset { id:id.into(),
+                waypoints:vec![(lat,0.0),(lat,0.001),(lat+0.001,0.001),(lat,0.0)],
+                close_mode:"rounded".into(),clip_fence:false,snap_road:false,random_main_road_edges:Vec::new(),random_source_ids:Vec::new() });
+        }
+        let originals=serde_json::to_string(&c.custom_route_presets).unwrap();
+        let pace=(c.pace_min,c.pace_max);
+        for id in ["stadium","campus"] {
+            c.apply_custom_preset(id);
+            let base=c.custom_waypoints.clone();
+            assert!(c.randomize_custom_preset(id));
+            assert_ne!(c.custom_waypoints,base);
+            assert_eq!(c.custom_close_mode,"rounded");
+            assert_eq!(c.allowed_skip_ordinary,0);
+            assert_eq!((c.pace_min,c.pace_max),pace);
+            assert_eq!(serde_json::to_string(&c.custom_route_presets).unwrap(), originals);
+            assert!(c.apply_custom_preset(id));
+            assert_eq!(c.custom_waypoints,base);
+        }
+        let before=c.custom_waypoints.clone();
+        assert!(!c.randomize_custom_preset("missing"));
+        assert_eq!(c.custom_waypoints,before);
+    }
+    #[test]
+    fn unified_preset_resolves_both_sources_and_manual_save_invalidates_pool() {
+        let mut c=Config::default();
+        for id in ["stadium","campus","unified"] {
+            c.custom_route_presets.push(CustomRoutePreset { id:id.into(),
+                waypoints:vec![(29.0,119.0),(29.001,119.0),(29.0,119.0)],
+                close_mode:"rounded".into(),clip_fence:false,snap_road:false,
+                random_main_road_edges:vec![0,1],random_source_ids:Vec::new() });
+        }
+        c.custom_route_presets[2].random_source_ids=vec!["stadium".into(),"campus".into(),"campus".into()];
+        assert_eq!(c.random_route_sources("unified").unwrap().iter().map(|p|p.id.as_str()).collect::<Vec<_>>(),vec!["stadium","campus"]);
+        c.apply_custom_preset("unified");
+        c.custom_waypoints.insert(1,(29.0005,119.0));
+        assert!(c.save_custom_preset("unified"));
+        assert!(c.custom_route_presets[2].random_source_ids.is_empty());
+        assert!(c.custom_route_presets[2].random_main_road_edges.is_empty());
+        assert_eq!(c.custom_route_presets[0].waypoints.len(),3);
+        c.custom_route_presets[2].random_source_ids=vec!["unified".into()];
+        assert!(c.random_route_sources("unified").is_err());
+        c.custom_route_presets[2].random_source_ids=vec!["missing".into()];
+        let before=c.custom_waypoints.clone();
+        assert!(c.randomize_main_road_preset("unified",&[]).is_err());
+        assert_eq!(before,c.custom_waypoints);
+    }
+    #[test]
+    #[ignore = "local combined-route audit; requires explicit private config and point paths"]
+    fn audit_local_unified_generation() {
+        let path=std::env::var("NEKO_ROUTE_CHECK_CONFIG").unwrap();
+        let mut c:Config=serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let path=std::env::var("NEKO_ROUTE_CHECK_POINTS").unwrap();
+        let pts:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let points:Vec<_>=pts["points"].as_array().unwrap().iter().map(|p|(p["lat"].as_f64().unwrap(),p["lon"].as_f64().unwrap())).collect();
+        let bases=serde_json::to_string(&c.custom_route_presets).unwrap();
+        let mut changed=std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            let before=c.custom_waypoints.clone();
+            c.randomize_main_road_preset("unified",&points).unwrap();
+            assert_ne!(before,c.custom_waypoints);
+            assert_eq!(bases,serde_json::to_string(&c.custom_route_presets).unwrap());
+            assert_eq!(c.custom_close_mode,"rounded");
+            assert_eq!(c.allowed_skip_ordinary,0);
+            changed.insert(serde_json::to_string(&c.custom_waypoints).unwrap());
+        }
+        assert!(changed.len()>5);
+    }
+    #[test]
+    fn generated_selection_survives_restart_and_detects_manual_edits() {
+        let mut c=Config::default();
+        c.custom_route_presets.push(CustomRoutePreset{id:"unified".into(),waypoints:vec![(29.0,119.0),(29.1,119.1)],close_mode:"rounded".into(),clip_fence:false,snap_road:false,random_main_road_edges:vec![],random_source_ids:vec![]});
+        c.apply_custom_preset("unified");c.custom_waypoints.reverse();
+        c.custom_generated_preset="unified".into();c.custom_generated_route_hash=c.custom_route_hash();
+        let mut c:Config=serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert!(c.custom_preset_random_selected("unified"));assert!(c.custom_preset_selected("unified"));
+        c.custom_waypoints[0].0+=0.001;assert!(!c.custom_preset_selected("unified"));
+        c.apply_custom_preset("unified");assert!(!c.custom_preset_random_selected("unified"));assert!(c.custom_preset_selected("unified"));
+    }
+    #[test]
+    fn old_config_without_presets_still_loads_and_missing_preset_is_safe() {
+        let mut c:Config=serde_json::from_str("{}").unwrap();
+        c.custom_waypoints=vec![(0.0,0.0),(0.0,0.001)];
+        let points=c.custom_waypoints.clone();
+        assert!(!c.apply_custom_preset("missing"));
+        assert_eq!(c.custom_waypoints,points);
+    }
 }

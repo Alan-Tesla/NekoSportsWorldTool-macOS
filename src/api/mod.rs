@@ -17,3 +17,5 @@ pub mod records;
 pub mod semester;
 pub mod submit;
 pub mod user;
+
+mod route_variants;
